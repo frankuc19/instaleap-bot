@@ -1,0 +1,17 @@
+# Build artifacts
+build/
+dist/
+*.spec.bak
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Ejecutable compilado grande (52 MB) — distribuir aparte
+dist_final/instaleap_bot
+
+# Debug temporales
+/tmp/instaleap_*.json
+
+# macOS
+.DS_Store
