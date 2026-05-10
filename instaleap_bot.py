@@ -108,6 +108,8 @@ class ControlTowerBot:
         self._auth_token: Optional[str]        = None
         self._api_schema_logged: bool          = False
         self._last_shoppers: List[Dict]        = []   # caché de shoppers para asignación
+        self._auto_assign_task: Optional[asyncio.Task]  = None
+        self._auto_assign_stop: Optional[asyncio.Event] = None
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -1361,6 +1363,150 @@ class ControlTowerBot:
         except Exception:
             return False
 
+    # ── Auto-asignación (algoritmo tipo Uber) ──────────────────────────────────
+
+    async def _auto_assign_loop(self, stop_event: asyncio.Event) -> None:
+        """
+        Ciclo de auto-asignación.  Cada CYCLE_SECS segundos:
+          1. Obtiene pedidos CREADOS de la hora actual.
+          2. Para cada pedido sin shopper asignado:
+             a. Llama al endpoint nebula para obtener shoppers activos.
+             b. Filtra: wants_to_receive_tasks=True  AND  distancia <= RADIUS_M.
+             c. Puntúa cada shopper:  score = 0.7*(dist/RADIUS_M) + 0.3*(orders/10)
+                (menor puntaje = mejor candidato).
+             d. Asigna el shopper con menor puntaje si odin_job_id disponible.
+        """
+        RADIUS_M   = 4_000   # 4 km expresados en metros (nebula entrega metros)
+        CYCLE_SECS = 30
+        assigned_refs: set = set()
+
+        console.print(
+            "\n  [bold green]▶  Auto-asignación iniciada "
+            f"(radio {RADIUS_M//1000} km, ciclo {CYCLE_SECS}s)[/bold green]\n"
+        )
+
+        while not stop_event.is_set():
+            try:
+                await self._ensure_token()
+                now = datetime.now()
+                date_str = now.strftime("%Y-%m-%d")
+                data     = await self._api_get_jobs(date_str, now.hour)
+                orders   = self._parse_jobs_response(data, f"{now.hour:02d}:00-{now.hour:02d}:59")
+
+                for order in orders:
+                    ref = order.get("reference", "")
+                    if ref in assigned_refs:
+                        continue
+
+                    task_id  = self._get_assignment_task_id(order)
+                    store_id = order.get("store_id", "")
+                    if not task_id or not store_id:
+                        continue
+
+                    # Resolver odin_job_id si no está en caché
+                    if not order.get("odin_job_id"):
+                        odin_id = await self._api_search_odin_job(ref)
+                        if odin_id:
+                            order["odin_job_id"] = odin_id
+
+                    odin_job_id = order.get("odin_job_id", "")
+                    if not odin_job_id:
+                        continue   # sin odin_job_id no podemos asignar via API
+
+                    resources = await self._api_get_shoppers_nebula(task_id, store_id)
+                    if not resources:
+                        continue
+
+                    # Filtrar activos dentro del radio
+                    candidates = []
+                    for r in resources:
+                        active = bool(
+                            r.get("wants_to_receive_tasks")
+                            or r.get("wantsToReceiveTasks")
+                            or r.get("available")
+                            or r.get("isAvailable")
+                            or r.get("active")
+                            or r.get("isActive")
+                            or str(r.get("status") or "").upper() in ("ACTIVE", "ACTIVO", "AVAILABLE", "ENABLED")
+                        )
+                        if not active:
+                            continue
+
+                        dist_raw = r.get("distance") or 0
+                        try:
+                            dist_m = float(dist_raw)
+                            if dist_m <= 20:          # ya estaba en km → convertir
+                                dist_m *= 1000
+                        except (TypeError, ValueError):
+                            dist_m = float("inf")
+
+                        if dist_m > RADIUS_M:
+                            continue
+
+                        orders_count = int(r.get("number_of_orders") or r.get("numberOfOrders") or 0)
+                        # Puntaje: menor = mejor (como Uber: proximidad pesa 70%, carga 30%)
+                        score = 0.7 * (dist_m / RADIUS_M) + 0.3 * (orders_count / 10.0)
+                        candidates.append((score, r))
+
+                    if not candidates:
+                        continue
+
+                    candidates.sort(key=lambda x: x[0])
+                    best_resource = candidates[0][1]
+                    best_score    = candidates[0][0]
+
+                    ok = await self._api_assign_shopper(odin_job_id, task_id, best_resource)
+                    shopper_name = (
+                        best_resource.get("name")
+                        or best_resource.get("fullName")
+                        or best_resource.get("id", "?")
+                    )
+                    if ok:
+                        assigned_refs.add(ref)
+                        console.print(
+                            f"  [bold green]✓ Auto-asignado:[/bold green] {ref} → "
+                            f"{shopper_name}  (score={best_score:.3f})"
+                        )
+                    else:
+                        console.print(
+                            f"  [yellow]✗ Fallo auto-asignación:[/yellow] {ref} → {shopper_name}"
+                        )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                console.print(f"  [red]  Error en ciclo auto-asignación: {exc}[/red]")
+
+            # Esperar CYCLE_SECS o hasta que stop_event se active
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=CYCLE_SECS)
+            except asyncio.TimeoutError:
+                pass
+
+        console.print("\n  [bold yellow]⏹  Auto-asignación detenida.[/bold yellow]\n")
+
+    async def start_auto_assign(self) -> None:
+        """Inicia el loop de auto-asignación en background."""
+        if self._auto_assign_task and not self._auto_assign_task.done():
+            console.print("  [yellow]  La auto-asignación ya está activa.[/yellow]")
+            return
+        self._auto_assign_stop = asyncio.Event()
+        self._auto_assign_task = asyncio.create_task(
+            self._auto_assign_loop(self._auto_assign_stop)
+        )
+
+    async def stop_auto_assign(self) -> None:
+        """Detiene el loop de auto-asignación y espera que termine."""
+        if self._auto_assign_stop:
+            self._auto_assign_stop.set()
+        if self._auto_assign_task:
+            try:
+                await asyncio.wait_for(self._auto_assign_task, timeout=10)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                self._auto_assign_task.cancel()
+            self._auto_assign_task = None
+            self._auto_assign_stop = None
+
 
 # ─── Helpers de UI ─────────────────────────────────────────────────────────────
 
@@ -1494,12 +1640,22 @@ async def run() -> None:
         # ── Menú principal ─────────────────────────────────────────────────────
         while True:
             console.print()
+            auto_running = (
+                bot._auto_assign_task is not None
+                and not bot._auto_assign_task.done()
+            )
+            auto_choice = (
+                questionary.Choice("⏹  Detener asignación automática", value="auto_stop")
+                if auto_running else
+                questionary.Choice("▶  Activar asignación automática", value="auto_start")
+            )
             action = await questionary.select(
                 "Menú principal:",
                 choices=[
                     questionary.Choice("📋  Actualizar pedidos del turno actual", value="refresh"),
                     questionary.Choice("📅  Ver pedidos por fecha",               value="bydate"),
                     questionary.Choice("🔍  Asignar shopper a un pedido",         value="assign"),
+                    auto_choice,
                     questionary.Choice("❌  Salir",                               value="exit"),
                 ],
                 style=BOT_STYLE,
@@ -1507,8 +1663,19 @@ async def run() -> None:
 
             # ── Salir ──────────────────────────────────────────────────────────
             if action == "exit":
+                await bot.stop_auto_assign()
                 console.print("\n[dim]  Cerrando bot. ¡Hasta luego![/dim]\n")
                 break
+
+            # ── Auto-asignación: iniciar ───────────────────────────────────────
+            if action == "auto_start":
+                await bot.start_auto_assign()
+                continue
+
+            # ── Auto-asignación: detener ───────────────────────────────────────
+            if action == "auto_stop":
+                await bot.stop_auto_assign()
+                continue
 
             # ── Pedidos por fecha elegida ──────────────────────────────────────
             if action == "bydate":
