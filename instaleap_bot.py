@@ -1850,7 +1850,7 @@ async def run() -> None:
                         value=o,
                     )
                     for o in visible
-                ] + [questionary.Choice("← Volver al menú", value=None)]
+                ] + [questionary.Choice("← Volver al menú", value="__back__")]
 
                 selected_order = await questionary.select(
                     "Pedido a asignar:",
@@ -1858,7 +1858,7 @@ async def run() -> None:
                     style=BOT_STYLE,
                 ).ask_async()
 
-                if not selected_order:
+                if not selected_order or selected_order == "__back__":
                     continue
 
                 o = selected_order
@@ -1900,7 +1900,7 @@ async def run() -> None:
                     shopper_choices.append(
                         questionary.Choice(label, value=s.get("btn_index", 0))
                     )
-                shopper_choices.append(questionary.Choice("← Cancelar", value=None))
+                shopper_choices.append(questionary.Choice("← Cancelar", value="__cancel__"))
 
                 btn_idx = await questionary.select(
                     "Shopper a asignar:",
@@ -1908,7 +1908,7 @@ async def run() -> None:
                     style=BOT_STYLE,
                 ).ask_async()
 
-                if btn_idx is None:
+                if btn_idx is None or btn_idx == "__cancel__":
                     console.print("[dim]  Asignación cancelada.[/dim]")
                     continue
 
