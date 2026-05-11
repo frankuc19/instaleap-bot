@@ -1959,6 +1959,7 @@ async def run() -> None:
                     avail_icon = "🟢" if "Activo" in s.get("availability", "") else "🔴"
                     label = (
                         f"{avail_icon}  {s.get('name', 'Shopper')}  ·  "
+                        f"{s.get('phone', '-')}  ·  "
                         f"{s.get('distance', '-')}  ·  "
                         f"{s.get('vehicle', '-')}  ·  "
                         f"{s.get('assigned_orders', '?')} pedidos"
