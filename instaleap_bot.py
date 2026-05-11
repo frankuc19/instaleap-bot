@@ -1153,6 +1153,7 @@ class ControlTowerBot:
         can_assign = available
 
         vehicle = str(r.get("vehicle_type") or r.get("vehicleType") or "-")
+        phone   = str(r.get("phone_number") or r.get("phoneNumber") or r.get("phone") or "-")
 
         return {
             "btn_index":       i,
@@ -1163,6 +1164,7 @@ class ControlTowerBot:
             "can_assign":      can_assign,
             "cupo":            cupo_label,
             "vehicle":         vehicle,
+            "phone":           phone,
             "_resource":       r,
         }
 
@@ -1628,6 +1630,7 @@ def _shoppers_table(shoppers: List[Dict]) -> Table:
     )
     t.add_column("#",              style="dim",        width=3,  justify="right")
     t.add_column("Nombre",         style="bold white", min_width=30)
+    t.add_column("Teléfono",       style="magenta",    min_width=14)
     t.add_column("Distancia",      style="cyan",       min_width=10, justify="right")
     t.add_column("Disponibilidad", style="bold",       min_width=14)
     t.add_column("Pedidos",        style="yellow",     min_width=10, justify="center")
@@ -1647,6 +1650,7 @@ def _shoppers_table(shoppers: List[Dict]) -> Table:
             str(i),
             f"[bold white]{s.get('name', f'Shopper {i}')}[/bold white]" if is_active
             else s.get("name", f"Shopper {i}"),
+            s.get("phone", "-"),
             s.get("distance", "-"),
             avail_str,
             s.get("assigned_orders", "-"),
