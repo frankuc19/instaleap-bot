@@ -110,6 +110,8 @@ class ControlTowerBot:
         self._last_shoppers: List[Dict]        = []   # caché de shoppers para asignación
         self._auto_assign_task: Optional[asyncio.Task]  = None
         self._auto_assign_stop: Optional[asyncio.Event] = None
+        self._karri_token: Optional[str]  = None
+        self._karri_phone_index: Dict[str, Dict] = {}   # phone → {status, locationId, …}
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -1168,6 +1170,21 @@ class ControlTowerBot:
             "_resource":       r,
         }
 
+    def _apply_karri_status(self, shoppers: List[Dict]) -> List[Dict]:
+        """
+        Cruza la lista de shoppers de Instaleap con _karri_phone_index por phone.
+        Añade 'karri_status': 'READY' | 'FREE' | '-' a cada shopper.
+        """
+        if not self._karri_phone_index:
+            for s in shoppers:
+                s.setdefault("karri_status", "-")
+            return shoppers
+        for s in shoppers:
+            phone = s.get("phone", "").strip()
+            entry = self._karri_phone_index.get(phone)
+            s["karri_status"] = entry["status"] if entry else "-"
+        return shoppers
+
     async def fetch_shoppers(self, order: Dict) -> List[Dict]:
         """
         Obtiene shoppers disponibles para un pedido.
@@ -1195,6 +1212,7 @@ class ControlTowerBot:
                 # Re-numerar btn_index tras el sort
                 for idx, s in enumerate(shoppers):
                     s["btn_index"] = idx
+                self._apply_karri_status(shoppers)
                 self._last_shoppers = shoppers
                 # Buscar odin_job_id si no lo tenemos
                 if not order.get("odin_job_id"):
@@ -1246,6 +1264,7 @@ class ControlTowerBot:
             seen: set = set()
             unique = [r for r in captured if r.get("id") and not seen.add(r["id"])]
             shoppers = [self._resource_to_shopper(i, r) for i, r in enumerate(unique)]
+            self._apply_karri_status(shoppers)
             self._last_shoppers = shoppers
             return shoppers
 
@@ -1257,6 +1276,7 @@ class ControlTowerBot:
                 for i, s in enumerate(raw):
                     s["btn_index"] = i
                     s.setdefault("_resource", {})
+                self._apply_karri_status(raw)
                 self._last_shoppers = raw
                 return raw
 
@@ -1392,6 +1412,55 @@ class ControlTowerBot:
         except Exception:
             return False
 
+    # ── Karri API ──────────────────────────────────────────────────────────────
+
+    async def _api_refresh_karri_index(self) -> None:
+        """
+        Descarga FREE + READY shoppers de la API de Karri y construye
+        _karri_phone_index  →  { phone_normalizado: {status, locationId, …} }
+        """
+        if not self._karri_token:
+            return
+        KARRI_BASE = "https://karri-walmart-apigateway-5g8g1c06.uk.gateway.dev/v1"
+        headers = {
+            "authorization": f"Bearer {self._karri_token}",
+            "content-type":  "application/json",
+            "origin":        "https://dashboard-walmart.karri.com.mx",
+        }
+        index: Dict[str, Dict] = {}
+
+        for status in ("READY", "FREE"):
+            try:
+                resp = await self.ctx.request.get(
+                    f"{KARRI_BASE}/shoppers?status={status}&limit=10000&page=1",
+                    headers=headers,
+                )
+                if not resp.ok:
+                    continue
+                data = await resp.json()
+                for s in data.get("shoppers", []):
+                    phone = str(s.get("phone") or "").strip()
+                    if not phone:
+                        continue
+                    # READY tiene prioridad sobre FREE si el mismo teléfono aparece en ambos
+                    if phone not in index or status == "READY":
+                        index[phone] = {
+                            "karri_id":   s.get("id"),
+                            "status":     status,
+                            "locationId": s.get("locationId"),
+                            "firstName":  s.get("firstName", ""),
+                            "lastName":   s.get("lastName", ""),
+                        }
+            except Exception:
+                pass
+
+        self._karri_phone_index = index
+        console.print(
+            f"  [dim]  Karri index actualizado: "
+            f"{sum(1 for v in index.values() if v['status']=='READY')} READY  "
+            f"{sum(1 for v in index.values() if v['status']=='FREE')} FREE[/dim]"
+        )
+
     # ── Auto-asignación (algoritmo tipo Uber) ──────────────────────────────────
 
     async def _auto_assign_loop(self, stop_event: asyncio.Event) -> None:
@@ -1417,6 +1486,8 @@ class ControlTowerBot:
         while not stop_event.is_set():
             try:
                 await self._ensure_token()
+                # Refrescar el índice de Karri en cada ciclo
+                await self._api_refresh_karri_index()
                 now = datetime.now()
                 date_str = now.strftime("%Y-%m-%d")
                 data     = await self._api_get_jobs(date_str, now.hour)
@@ -1478,10 +1549,20 @@ class ControlTowerBot:
                         if dist_m > RADIUS_M:
                             continue
 
+                        # ── Cruce con Karri: si el índice existe, excluir shoppers ausentes
+                        phone = str(r.get("phone_number") or r.get("phoneNumber") or r.get("phone") or "").strip()
+                        karri_status = "-"
+                        if self._karri_phone_index:
+                            entry = self._karri_phone_index.get(phone)
+                            if not entry:
+                                continue   # shopper no está en Karri → omitir
+                            karri_status = entry["status"]   # "READY" o "FREE"
+
                         orders_count = int(r.get("number_of_orders") or r.get("numberOfOrders") or 0)
                         vehicle = str(r.get("vehicle_type") or r.get("vehicleType") or "").strip()
-                        # Puntaje: menor = mejor (como Uber: proximidad pesa 70%, carga 30%)
-                        score = 0.7 * (dist_m / RADIUS_M) + 0.3 * (orders_count / 10.0)
+                        # Puntaje: 0.6 dist + 0.3 carga + 0.1 karri (READY=0, FREE=0.1)
+                        karri_bonus = 0.0 if karri_status == "READY" else 0.1
+                        score = 0.6 * (dist_m / RADIUS_M) + 0.3 * (orders_count / 10.0) + karri_bonus
                         candidates.append((score, vehicle, r))
 
                     if not candidates:
@@ -1631,6 +1712,7 @@ def _shoppers_table(shoppers: List[Dict]) -> Table:
     t.add_column("#",              style="dim",        width=3,  justify="right")
     t.add_column("Nombre",         style="bold white", min_width=30)
     t.add_column("Teléfono",       style="magenta",    min_width=14)
+    t.add_column("Karri",          style="bold",       min_width=8,  justify="center")
     t.add_column("Distancia",      style="cyan",       min_width=10, justify="right")
     t.add_column("Disponibilidad", style="bold",       min_width=14)
     t.add_column("Pedidos",        style="yellow",     min_width=10, justify="center")
@@ -1642,15 +1724,20 @@ def _shoppers_table(shoppers: List[Dict]) -> Table:
         is_active = "Activo" in avail
         avail_str = "[green]● Activo[/green]" if is_active else "[dim]○ Inactivo[/dim]"
         cupo_raw  = s.get("cupo", "")
-        if cupo_raw == "Con cupo":
-            cap = "[yellow]Con cupo[/yellow]"
+        cap = "[yellow]Con cupo[/yellow]" if cupo_raw == "Con cupo" else "[dim]Sin cupo[/dim]"
+        ks = s.get("karri_status", "-")
+        if ks == "READY":
+            karri_str = "[bold green]READY[/bold green]"
+        elif ks == "FREE":
+            karri_str = "[cyan]FREE[/cyan]"
         else:
-            cap = "[dim]Sin cupo[/dim]"
+            karri_str = "[dim]-[/dim]"
         t.add_row(
             str(i),
             f"[bold white]{s.get('name', f'Shopper {i}')}[/bold white]" if is_active
             else s.get("name", f"Shopper {i}"),
             s.get("phone", "-"),
+            karri_str,
             s.get("distance", "-"),
             avail_str,
             s.get("assigned_orders", "-"),
@@ -1692,6 +1779,31 @@ async def run() -> None:
 
         token_ok = "[green]✓ API conectada[/green]" if bot._auth_token else "[yellow]⚠ sin token API[/yellow]"
         console.print(f"  [bold green]✓[/bold green] Sesión iniciada · {token_ok}\n")
+
+        # ── Token Karri (opcional) ─────────────────────────────────────────────
+        console.print(Rule("[bold yellow]Karri Dashboard[/bold yellow]"))
+        use_karri = await questionary.confirm(
+            "¿Tienes un token de Karri para cruzar la fila de shoppers?",
+            default=False,
+            style=BOT_STYLE,
+        ).ask_async()
+        if use_karri:
+            karri_token_raw = await questionary.text(
+                "Pega el Bearer token de Karri:",
+                style=BOT_STYLE,
+            ).ask_async()
+            if karri_token_raw and karri_token_raw.strip():
+                bot._karri_token = karri_token_raw.strip()
+                with console.status("[bold yellow]Cargando fila de shoppers Karri...[/bold yellow]"):
+                    await bot._api_refresh_karri_index()
+                console.print(
+                    f"  [bold green]✓[/bold green] Karri conectado  "
+                    f"({len(bot._karri_phone_index)} shoppers indexados)\n"
+                )
+            else:
+                console.print("  [dim]  Token vacío — Karri desactivado.[/dim]\n")
+        else:
+            console.print("  [dim]  Karri desactivado — sin cruce de fila.[/dim]\n")
 
         # ── Estado ─────────────────────────────────────────────────────────────
         cached_orders: List[Dict] = []
@@ -1957,12 +2069,15 @@ async def run() -> None:
                 shopper_choices = []
                 for s in shoppers:
                     avail_icon = "🟢" if "Activo" in s.get("availability", "") else "🔴"
+                    ks = s.get("karri_status", "-")
+                    karri_tag = "[READY]" if ks == "READY" else "[FREE]" if ks == "FREE" else ""
                     label = (
                         f"{avail_icon}  {s.get('name', 'Shopper')}  ·  "
                         f"{s.get('phone', '-')}  ·  "
                         f"{s.get('distance', '-')}  ·  "
                         f"{s.get('vehicle', '-')}  ·  "
                         f"{s.get('assigned_orders', '?')} pedidos"
+                        + (f"  {karri_tag}" if karri_tag else "")
                     )
                     shopper_choices.append(
                         questionary.Choice(label, value=s.get("btn_index", 0))
