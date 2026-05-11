@@ -1417,9 +1417,15 @@ class ControlTowerBot:
                     if not resources:
                         continue
 
-                    # Filtrar activos dentro del radio
+                    # Filtrar activos, dentro del radio y solo shoppers KARRI
                     candidates = []
                     for r in resources:
+                        shopper_name = (
+                            r.get("name") or r.get("fullName") or r.get("displayName") or ""
+                        )
+                        if "karri" not in shopper_name.lower():
+                            continue
+
                         active = bool(
                             r.get("wants_to_receive_tasks")
                             or r.get("wantsToReceiveTasks")
@@ -1879,9 +1885,15 @@ async def run() -> None:
                 with console.status("[bold blue]Cargando shoppers disponibles...[/bold blue]"):
                     shoppers = await bot.fetch_shoppers(selected_order)
 
+                # Solo shoppers KARRI
+                shoppers = [
+                    s for s in shoppers
+                    if "karri" in s.get("name", "").lower()
+                ]
+
                 if not shoppers:
                     console.print(
-                        "[yellow]  No se encontraron shoppers en el panel de asignación.[/yellow]\n"
+                        "[yellow]  No se encontraron shoppers KARRI en el panel de asignación.[/yellow]\n"
                         "[dim]  Verifica manualmente en Control Tower.[/dim]"
                     )
                     continue
