@@ -468,6 +468,29 @@ class ControlTowerBot:
                 if isinstance(t, dict) and t.get("id")
             ]
 
+            # ── Items del pedido ──────────────────────────────────────────────
+            _items_raw = (
+                nebula.get("products")
+                or nebula.get("items")
+                or nebula.get("order_items")
+                or custom.get("products")
+                or custom.get("items")
+                or None
+            )
+            if isinstance(_items_raw, list):
+                items_count = str(len(_items_raw))
+            elif _items_raw is not None:
+                items_count = str(_items_raw)
+            else:
+                _num = (
+                    nebula.get("num_products")
+                    or nebula.get("num_items")
+                    or nebula.get("total_items")
+                    or custom.get("num_products")
+                    or custom.get("total_items")
+                )
+                items_count = str(_num) if _num is not None else "-"
+
             if not reference:
                 continue
 
@@ -488,6 +511,7 @@ class ControlTowerBot:
                 "store_id":     store_id,
                 "tasks":        tasks,
                 "odin_job_id":  "",
+                "items_count":  items_count,
             })
 
         return orders
@@ -1128,6 +1152,8 @@ class ControlTowerBot:
         # los inactivos aún pueden asignarse (la UI muestra el botón), se marcan distintos
         can_assign = available
 
+        vehicle = str(r.get("vehicle_type") or r.get("vehicleType") or "-")
+
         return {
             "btn_index":       i,
             "name":            name,
@@ -1136,6 +1162,7 @@ class ControlTowerBot:
             "assigned_orders": str(assigned),
             "can_assign":      can_assign,
             "cupo":            cupo_label,
+            "vehicle":         vehicle,
             "_resource":       r,
         }
 
@@ -1551,6 +1578,7 @@ def _orders_table(orders: List[Dict], title: str) -> Table:
     t.add_column("Creación",   style="white",     min_width=16)
     t.add_column("Cliente",    style="green",     min_width=18)
     t.add_column("Teléfono",   style="magenta",   min_width=14)
+    t.add_column("Items",      style="cyan",      width=6,  justify="right")
     t.add_column("Pago",       style="white",     min_width=14)
     t.add_column("Estado",     style="bold",      min_width=10)
 
@@ -1563,6 +1591,7 @@ def _orders_table(orders: List[Dict], title: str) -> Table:
             o.get("creation", "").replace("UTC-6", "").strip(),
             o.get("client_name", ""),
             o.get("client_phone", ""),
+            o.get("items_count", "-"),
             o.get("payment", ""),
             "[bold green]Creado[/bold green]",
         )
@@ -1583,6 +1612,7 @@ def _shoppers_table(shoppers: List[Dict]) -> Table:
     t.add_column("Distancia",      style="cyan",       min_width=10, justify="right")
     t.add_column("Disponibilidad", style="bold",       min_width=14)
     t.add_column("Pedidos",        style="yellow",     min_width=10, justify="center")
+    t.add_column("Vehículo",       style="magenta",    min_width=12, justify="center")
     t.add_column("Cupo",           style="bold",       min_width=12, justify="center")
 
     for i, s in enumerate(shoppers, 1):
@@ -1590,7 +1620,6 @@ def _shoppers_table(shoppers: List[Dict]) -> Table:
         is_active = "Activo" in avail
         avail_str = "[green]● Activo[/green]" if is_active else "[dim]○ Inactivo[/dim]"
         cupo_raw  = s.get("cupo", "")
-        # Cupo: informativo solamente (todos los shoppers del endpoint son asignables)
         if cupo_raw == "Con cupo":
             cap = "[yellow]Con cupo[/yellow]"
         else:
@@ -1602,6 +1631,7 @@ def _shoppers_table(shoppers: List[Dict]) -> Table:
             s.get("distance", "-"),
             avail_str,
             s.get("assigned_orders", "-"),
+            s.get("vehicle", "-"),
             cap,
         )
     return t
@@ -1907,6 +1937,7 @@ async def run() -> None:
                     label = (
                         f"{avail_icon}  {s.get('name', 'Shopper')}  ·  "
                         f"{s.get('distance', '-')}  ·  "
+                        f"{s.get('vehicle', '-')}  ·  "
                         f"{s.get('assigned_orders', '?')} pedidos"
                     )
                     shopper_choices.append(
