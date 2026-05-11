@@ -1477,16 +1477,35 @@ class ControlTowerBot:
                             continue
 
                         orders_count = int(r.get("number_of_orders") or r.get("numberOfOrders") or 0)
+                        vehicle = str(r.get("vehicle_type") or r.get("vehicleType") or "").strip()
                         # Puntaje: menor = mejor (como Uber: proximidad pesa 70%, carga 30%)
                         score = 0.7 * (dist_m / RADIUS_M) + 0.3 * (orders_count / 10.0)
-                        candidates.append((score, r))
+                        candidates.append((score, vehicle, r))
 
                     if not candidates:
                         continue
 
-                    candidates.sort(key=lambda x: x[0])
-                    best_resource = candidates[0][1]
-                    best_score    = candidates[0][0]
+                    # ── Lógica de vehículo según cantidad de items ────────────
+                    try:
+                        items_n = int(order.get("items_count") or 0)
+                    except (ValueError, TypeError):
+                        items_n = 0
+
+                    motos = [(sc, v, r) for sc, v, r in candidates if "moto" in v.lower()]
+                    autos = [(sc, v, r) for sc, v, r in candidates if "moto" not in v.lower()]
+
+                    if items_n > 0 and items_n <= 15:
+                        # Preferir moto; si no hay, usar auto
+                        pool = motos if motos else autos
+                        vehicle_note = "moto (≤15 items)" if motos else "auto (sin motos disponibles)"
+                    else:
+                        # >15 items o sin dato → solo autos
+                        pool = autos if autos else candidates
+                        vehicle_note = "auto (>15 items)" if items_n > 15 else "auto (sin dato de items)"
+
+                    pool.sort(key=lambda x: x[0])
+                    best_resource = pool[0][2]
+                    best_score    = pool[0][0]
 
                     ok = await self._api_assign_shopper(odin_job_id, task_id, best_resource)
                     shopper_name = (
@@ -1498,7 +1517,7 @@ class ControlTowerBot:
                         assigned_refs.add(ref)
                         console.print(
                             f"  [bold green]✓ Auto-asignado:[/bold green] {ref} → "
-                            f"{shopper_name}  (score={best_score:.3f})"
+                            f"{shopper_name}  [{vehicle_note}]  (score={best_score:.3f})"
                         )
                     else:
                         console.print(
