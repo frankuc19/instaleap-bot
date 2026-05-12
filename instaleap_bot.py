@@ -1643,8 +1643,15 @@ class ControlTowerBot:
                 (menor puntaje = mejor candidato).
              d. Asigna el shopper con menor puntaje si odin_job_id disponible.
         """
-        RADIUS_M   = 4_000   # 4 km expresados en metros (nebula entrega metros)
-        CYCLE_SECS = 30
+        RADIUS_M    = 4_000   # 4 km en metros
+        CYCLE_SECS  = 30
+        MAX_PER_SLOT = 2      # máximo de pedidos por shopper en el mismo slot
+
+        # ref → (shopper_id, slot)  para detectar rechazos
+        order_shopper_map: Dict[str, tuple] = {}
+        # shopper_id → {slot → cantidad asignada esta sesión}
+        assigned_per_shopper: Dict[str, Dict[str, int]] = {}
+        # pedidos ya asignados esta sesión (se elimina si el shopper rechaza)
         assigned_refs: set = set()
 
         store_label = (
@@ -1653,13 +1660,13 @@ class ControlTowerBot:
         console.print(
             "\n  [bold green]▶  Auto-asignación iniciada "
             f"(radio {RADIUS_M//1000} km, ciclo {CYCLE_SECS}s, "
+            f"máx {MAX_PER_SLOT} pedidos/shopper/slot, "
             f"tiendas: {store_label})[/bold green]\n"
         )
 
         while not stop_event.is_set():
             try:
                 await self._ensure_token()
-                # Refrescar el índice de Karri en cada ciclo
                 await self._api_refresh_karri_index()
                 now      = datetime.now()
                 date_str = now.strftime("%Y-%m-%d")
@@ -1669,12 +1676,27 @@ class ControlTowerBot:
                     data = await self._api_get_jobs(date_str, h)
                     orders.extend(self._parse_jobs_response(data, f"{h:02d}:00-{h:02d}:59"))
 
+                # ── Detectar rechazos: un pedido asignado que reaparece como
+                #    CREATED significa que el shopper lo rechazó → liberar
+                current_refs = {o.get("reference", "") for o in orders}
+                for ref in list(assigned_refs):
+                    if ref in current_refs:
+                        assigned_refs.discard(ref)
+                        if ref in order_shopper_map:
+                            prev_sid, prev_slot = order_shopper_map.pop(ref)
+                            slots = assigned_per_shopper.get(prev_sid, {})
+                            if slots.get(prev_slot, 0) > 0:
+                                slots[prev_slot] -= 1
+                        console.print(
+                            f"  [yellow]↩ Pedido {ref} rechazado por el shopper "
+                            f"→ disponible para reasignación[/yellow]"
+                        )
+
                 for order in orders:
                     ref = order.get("reference", "")
                     if ref in assigned_refs:
                         continue
 
-                    # Filtro por tienda (si se especificaron tiendas al activar)
                     if allowed_stores and order.get("store", "") not in allowed_stores:
                         continue
 
@@ -1683,7 +1705,6 @@ class ControlTowerBot:
                     if not task_id or not store_id:
                         continue
 
-                    # Resolver odin_job_id si no está en caché
                     if not order.get("odin_job_id"):
                         odin_id = await self._api_search_odin_job(ref)
                         if odin_id:
@@ -1691,13 +1712,14 @@ class ControlTowerBot:
 
                     odin_job_id = order.get("odin_job_id", "")
                     if not odin_job_id:
-                        continue   # sin odin_job_id no podemos asignar via API
+                        continue
 
                     resources = await self._api_get_shoppers_nebula(task_id, store_id)
                     if not resources:
                         continue
 
-                    # Filtrar activos, dentro del radio y solo shoppers KARRI
+                    slot_str = order.get("slot", "")
+
                     candidates = []
                     for r in resources:
                         shopper_name = (
@@ -1721,7 +1743,7 @@ class ControlTowerBot:
                         dist_raw = r.get("distance") or 0
                         try:
                             dist_m = float(dist_raw)
-                            if dist_m <= 20:          # ya estaba en km → convertir
+                            if dist_m <= 20:
                                 dist_m *= 1000
                         except (TypeError, ValueError):
                             dist_m = float("inf")
@@ -1729,42 +1751,42 @@ class ControlTowerBot:
                         if dist_m > RADIUS_M:
                             continue
 
-                        # ── Cruce con Karri: solo shoppers con estado READY
                         phone = str(r.get("phone_number") or r.get("phoneNumber") or r.get("phone") or "").strip()
                         if self._karri_phone_index:
                             entry = self._karri_phone_index.get(phone)
                             if not entry or entry["status"] != "READY":
-                                continue   # no está en Karri o no es READY → omitir
+                                continue
+
+                        # ── Límite: máx MAX_PER_SLOT pedidos por shopper en este slot
+                        shopper_id = str(r.get("id") or r.get("resourceId") or phone)
+                        if assigned_per_shopper.get(shopper_id, {}).get(slot_str, 0) >= MAX_PER_SLOT:
+                            continue
 
                         orders_count = int(r.get("number_of_orders") or r.get("numberOfOrders") or 0)
                         vehicle = str(r.get("vehicle_type") or r.get("vehicleType") or "").strip()
                         score = 0.7 * (dist_m / RADIUS_M) + 0.3 * (orders_count / 10.0)
-                        candidates.append((score, vehicle, r))
+                        candidates.append((score, vehicle, shopper_id, r))
 
                     if not candidates:
                         continue
 
-                    # ── Lógica de vehículo según cantidad de items ────────────
                     try:
                         items_n = int(order.get("items_count") or 0)
                     except (ValueError, TypeError):
                         items_n = 0
 
-                    motos = [(sc, v, r) for sc, v, r in candidates if "moto" in v.lower()]
-                    autos = [(sc, v, r) for sc, v, r in candidates if "moto" not in v.lower()]
+                    motos = [(sc, v, sid, r) for sc, v, sid, r in candidates if "moto" in v.lower()]
+                    autos = [(sc, v, sid, r) for sc, v, sid, r in candidates if "moto" not in v.lower()]
 
                     if items_n > 0 and items_n <= 15:
-                        # Preferir moto; si no hay, usar auto
                         pool = motos if motos else autos
                         vehicle_note = "moto (≤15 items)" if motos else "auto (sin motos disponibles)"
                     else:
-                        # >15 items o sin dato → solo autos
                         pool = autos if autos else candidates
                         vehicle_note = "auto (>15 items)" if items_n > 15 else "auto (sin dato de items)"
 
                     pool.sort(key=lambda x: x[0])
-                    best_resource = pool[0][2]
-                    best_score    = pool[0][0]
+                    best_score, _, best_sid, best_resource = pool[0]
 
                     ok = await self._api_assign_shopper(odin_job_id, task_id, best_resource)
                     shopper_name = (
@@ -1774,9 +1796,14 @@ class ControlTowerBot:
                     )
                     if ok:
                         assigned_refs.add(ref)
+                        order_shopper_map[ref] = (best_sid, slot_str)
+                        slots = assigned_per_shopper.setdefault(best_sid, {})
+                        slots[slot_str] = slots.get(slot_str, 0) + 1
                         console.print(
                             f"  [bold green]✓ Auto-asignado:[/bold green] {ref} → "
-                            f"{shopper_name}  [{vehicle_note}]  (score={best_score:.3f})"
+                            f"{shopper_name}  [{vehicle_note}]  "
+                            f"(score={best_score:.3f}, slot {slot_str}: "
+                            f"{slots[slot_str]}/{MAX_PER_SLOT})"
                         )
                     else:
                         console.print(
@@ -1788,7 +1815,6 @@ class ControlTowerBot:
             except Exception as exc:
                 console.print(f"  [red]  Error en ciclo auto-asignación: {exc}[/red]")
 
-            # Esperar CYCLE_SECS o hasta que stop_event se active
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=CYCLE_SECS)
             except asyncio.TimeoutError:
