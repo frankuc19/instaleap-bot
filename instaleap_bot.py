@@ -110,8 +110,11 @@ class ControlTowerBot:
         self._last_shoppers: List[Dict]        = []   # caché de shoppers para asignación
         self._auto_assign_task: Optional[asyncio.Task]  = None
         self._auto_assign_stop: Optional[asyncio.Event] = None
-        self._karri_token: Optional[str]  = None
+        self._karri_token: Optional[str]       = None
         self._karri_phone_index: Dict[str, Dict] = {}   # phone → {status, locationId, …}
+        self._karri_email: Optional[str]      = None
+        self._karri_password: Optional[str]   = None
+        self._karri_token_at: float           = 0.0     # timestamp del último login Karri
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -1414,11 +1417,89 @@ class ControlTowerBot:
 
     # ── Karri API ──────────────────────────────────────────────────────────────
 
+    async def _login_karri_and_capture_token(self) -> bool:
+        """
+        Abre el dashboard de Karri en una nueva pestaña, hace login con
+        _karri_email/_karri_password, intercepta el Bearer de los requests
+        a la API gateway y lo almacena en _karri_token.
+        """
+        if not self._karri_email or not self._karri_password:
+            return False
+
+        KARRI_DASHBOARD = "https://dashboard-walmart.karri.com.mx/"
+        KARRI_API_HOST  = "karri-walmart-apigateway-5g8g1c06.uk.gateway.dev"
+        captured: list  = []
+
+        karri_page = await self.browser.new_page()
+        try:
+            def on_request(request: Any) -> None:
+                auth = request.headers.get("authorization", "")
+                if auth.startswith("Bearer ") and KARRI_API_HOST in request.url:
+                    token = auth[7:]
+                    if token and not captured:
+                        captured.append(token)
+
+            karri_page.on("request", on_request)
+
+            await karri_page.goto(KARRI_DASHBOARD, wait_until="domcontentloaded", timeout=30_000)
+
+            # Esperar y llenar el formulario de login (Firebase/React)
+            await karri_page.wait_for_selector(
+                'input[type="email"], input[name="email"], input[placeholder*="mail" i]',
+                timeout=15_000,
+            )
+            await karri_page.fill(
+                'input[type="email"], input[name="email"], input[placeholder*="mail" i]',
+                self._karri_email,
+            )
+            await karri_page.fill(
+                'input[type="password"], input[name="password"]',
+                self._karri_password,
+            )
+            await karri_page.click('button[type="submit"]')
+
+            # Esperar a que el dashboard cargue y dispare requests a la API
+            try:
+                await karri_page.wait_for_load_state("networkidle", timeout=20_000)
+            except Exception:
+                pass
+
+            # Espera extra si aún no capturamos el token
+            for _ in range(10):
+                if captured:
+                    break
+                await asyncio.sleep(1)
+
+            if captured:
+                self._karri_token    = captured[0]
+                self._karri_token_at = asyncio.get_event_loop().time()
+                console.print("  [bold green]✓  Token Karri capturado automáticamente.[/bold green]")
+                return True
+
+            console.print("  [yellow]  No se pudo capturar el token de Karri.[/yellow]")
+            return False
+
+        except Exception as exc:
+            console.print(f"  [red]  Error login Karri: {exc}[/red]")
+            return False
+        finally:
+            await karri_page.close()
+
+    async def _ensure_karri_token(self) -> None:
+        """Renueva el token de Karri si pasaron más de 55 minutos."""
+        if not self._karri_email or not self._karri_password:
+            return
+        elapsed = asyncio.get_event_loop().time() - self._karri_token_at
+        if elapsed > 55 * 60:   # 55 minutos
+            console.print("  [dim]  Renovando token Karri...[/dim]")
+            await self._login_karri_and_capture_token()
+
     async def _api_refresh_karri_index(self) -> None:
         """
         Descarga FREE + READY shoppers de la API de Karri y construye
         _karri_phone_index  →  { phone_normalizado: {status, locationId, …} }
         """
+        await self._ensure_karri_token()
         if not self._karri_token:
             return
         KARRI_BASE = "https://karri-walmart-apigateway-5g8g1c06.uk.gateway.dev/v1"
@@ -1780,28 +1861,38 @@ async def run() -> None:
         token_ok = "[green]✓ API conectada[/green]" if bot._auth_token else "[yellow]⚠ sin token API[/yellow]"
         console.print(f"  [bold green]✓[/bold green] Sesión iniciada · {token_ok}\n")
 
-        # ── Token Karri (opcional) ─────────────────────────────────────────────
+        # ── Login Karri (opcional) ─────────────────────────────────────────────
         console.print(Rule("[bold yellow]Karri Dashboard[/bold yellow]"))
         use_karri = await questionary.confirm(
-            "¿Tienes un token de Karri para cruzar la fila de shoppers?",
-            default=False,
+            "¿Conectar con Karri Dashboard para cruzar la fila de shoppers?",
+            default=True,
             style=BOT_STYLE,
         ).ask_async()
         if use_karri:
-            karri_token_raw = await questionary.text(
-                "Pega el Bearer token de Karri:",
+            karri_email = await questionary.text(
+                "Email de Karri:",
                 style=BOT_STYLE,
             ).ask_async()
-            if karri_token_raw and karri_token_raw.strip():
-                bot._karri_token = karri_token_raw.strip()
-                with console.status("[bold yellow]Cargando fila de shoppers Karri...[/bold yellow]"):
-                    await bot._api_refresh_karri_index()
-                console.print(
-                    f"  [bold green]✓[/bold green] Karri conectado  "
-                    f"({len(bot._karri_phone_index)} shoppers indexados)\n"
-                )
+            karri_pass = await questionary.password(
+                "Contraseña de Karri:",
+                style=BOT_STYLE,
+            ).ask_async()
+            if karri_email and karri_pass:
+                bot._karri_email    = karri_email.strip()
+                bot._karri_password = karri_pass
+                with console.status("[bold yellow]Iniciando sesión en Karri...[/bold yellow]"):
+                    ok = await bot._login_karri_and_capture_token()
+                if ok:
+                    with console.status("[bold yellow]Cargando fila de shoppers Karri...[/bold yellow]"):
+                        await bot._api_refresh_karri_index()
+                    console.print(
+                        f"  [bold green]✓[/bold green] Karri conectado  "
+                        f"({len(bot._karri_phone_index)} shoppers indexados)\n"
+                    )
+                else:
+                    console.print("  [yellow]  No se pudo conectar a Karri — continuando sin cruce.[/yellow]\n")
             else:
-                console.print("  [dim]  Token vacío — Karri desactivado.[/dim]\n")
+                console.print("  [dim]  Credenciales vacías — Karri desactivado.[/dim]\n")
         else:
             console.print("  [dim]  Karri desactivado — sin cruce de fila.[/dim]\n")
 
