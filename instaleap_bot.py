@@ -331,7 +331,7 @@ class ControlTowerBot:
                 "page":               page,
                 "page_size":          page_size,
                 "status":             "CREATED",
-                "operative_models":   "FULL_SERVICE",
+                "operative_models":   "FULL_SERVICE,PICK_AND_DELIVERY_WITH_STORAGE_NO_TRANSFER",
                 "slot_from_store_tz": json.dumps(slot_from, separators=(",", ":")),
                 "slot_to_store_tz":   json.dumps(slot_to,   separators=(",", ":")),
                 "slot_reason":        "STATIC",
@@ -564,7 +564,7 @@ class ControlTowerBot:
         """
         reference = order.get("reference", "")
         await self._goto(
-            f"{METRICS_URL}?page=1&page_size=200&status=CREATED&operative_models=FULL_SERVICE",
+            f"{METRICS_URL}?page=1&page_size=200&status=CREATED&operative_models=FULL_SERVICE,PICK_AND_DELIVERY_WITH_STORAGE_NO_TRANSFER",
             timeout=25_000,
         )
         await asyncio.sleep(5)
@@ -921,7 +921,7 @@ class ControlTowerBot:
 
         self.page.on("response", on_response)
         await self._goto(
-            f"{METRICS_URL}?page=1&page_size=200&status=CREATED&operative_models=FULL_SERVICE",
+            f"{METRICS_URL}?page=1&page_size=200&status=CREATED&operative_models=FULL_SERVICE,PICK_AND_DELIVERY_WITH_STORAGE_NO_TRANSFER",
             timeout=25_000,
         )
         await asyncio.sleep(6)
@@ -965,7 +965,7 @@ class ControlTowerBot:
         order_url: Optional[str] = None
         for page_num in range(1, 4):
             await self._goto(
-                f"{METRICS_URL}?page={page_num}&page_size=100&status=CREATED&operative_models=FULL_SERVICE",
+                f"{METRICS_URL}?page={page_num}&page_size=100&status=CREATED&operative_models=FULL_SERVICE,PICK_AND_DELIVERY_WITH_STORAGE_NO_TRANSFER",
                 timeout=25_000,
             )
             await asyncio.sleep(5)
@@ -1011,7 +1011,7 @@ class ControlTowerBot:
 
         # ── Fallback: clic en la fila (para el caso en que no haya <a> con href)
         await self._goto(
-            f"{METRICS_URL}?page=1&page_size=100&status=CREATED&operative_models=FULL_SERVICE",
+            f"{METRICS_URL}?page=1&page_size=100&status=CREATED&operative_models=FULL_SERVICE,PICK_AND_DELIVERY_WITH_STORAGE_NO_TRANSFER",
             timeout=25_000,
         )
         await asyncio.sleep(5)
