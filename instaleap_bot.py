@@ -284,11 +284,15 @@ class ControlTowerBot:
 
     @staticmethod
     def current_slots() -> List[Dict[str, Any]]:
-        """Devuelve el slot actual y los 2 siguientes."""
-        now = datetime.now()
-        slots = []
-        for i in range(3):
-            h = (now + timedelta(hours=i)).hour
+        """
+        Devuelve todos los slots del día desde las 06:00 hasta la hora
+        actual + 2 (máx 22:00).  Así se capturan pedidos CREATED con
+        slots pasados que aún no han sido asignados.
+        """
+        now     = datetime.now()
+        hour_to = min((now + timedelta(hours=2)).hour, 22)
+        slots   = []
+        for h in range(6, hour_to + 1):
             slots.append({
                 "hour":     h,
                 "slot_str": f"{h:02d}:00-{h:02d}:59",
@@ -1569,10 +1573,13 @@ class ControlTowerBot:
                 await self._ensure_token()
                 # Refrescar el índice de Karri en cada ciclo
                 await self._api_refresh_karri_index()
-                now = datetime.now()
+                now      = datetime.now()
                 date_str = now.strftime("%Y-%m-%d")
-                data     = await self._api_get_jobs(date_str, now.hour)
-                orders   = self._parse_jobs_response(data, f"{now.hour:02d}:00-{now.hour:02d}:59")
+                hour_to  = min((now + timedelta(hours=2)).hour, 22)
+                orders: List[Dict] = []
+                for h in range(6, hour_to + 1):
+                    data = await self._api_get_jobs(date_str, h)
+                    orders.extend(self._parse_jobs_response(data, f"{h:02d}:00-{h:02d}:59"))
 
                 for order in orders:
                     ref = order.get("reference", "")
