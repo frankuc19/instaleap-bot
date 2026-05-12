@@ -110,8 +110,9 @@ class ControlTowerBot:
         self._last_shoppers: List[Dict]        = []   # caché de shoppers para asignación
         self._auto_assign_task: Optional[asyncio.Task]  = None
         self._auto_assign_stop: Optional[asyncio.Event] = None
-        self._karri_token: Optional[str]       = None
+        self._karri_token: Optional[str]        = None
         self._karri_phone_index: Dict[str, Dict] = {}   # phone → {status, locationId, …}
+        self._karri_locations: Dict[int, str]    = {}   # locationId → nombre de tienda
         self._karri_email: Optional[str]      = "francisco.martinez@karri.com.mx"
         self._karri_password: Optional[str]   = "Karri.2027"
         self._karri_token_at: float           = 0.0     # timestamp del último login Karri
@@ -1185,7 +1186,8 @@ class ControlTowerBot:
         for s in shoppers:
             phone = s.get("phone", "").strip()
             entry = self._karri_phone_index.get(phone)
-            s["karri_status"] = entry["status"] if entry else "-"
+            s["karri_status"]   = entry["status"]       if entry else "-"
+            s["karri_location"] = entry["locationName"] if entry else "-"
         return shoppers
 
     async def fetch_shoppers(self, order: Dict) -> List[Dict]:
@@ -1508,6 +1510,28 @@ class ControlTowerBot:
             "content-type":  "application/json",
             "origin":        "https://dashboard-walmart.karri.com.mx",
         }
+
+        # ── Catálogo de ubicaciones (solo si aún no lo tenemos) ──────────────
+        if not self._karri_locations:
+            try:
+                resp_loc = await self.ctx.request.get(
+                    f"{KARRI_BASE}/locations?limit=1000&page=1",
+                    headers=headers,
+                )
+                if resp_loc.ok:
+                    loc_data = await resp_loc.json()
+                    locs = (
+                        loc_data.get("data", {}).get("data", [])
+                        if isinstance(loc_data.get("data"), dict)
+                        else loc_data.get("data", [])
+                    )
+                    self._karri_locations = {
+                        int(l["id"]): str(l.get("name", ""))
+                        for l in locs if l.get("id")
+                    }
+            except Exception:
+                pass
+
         index: Dict[str, Dict] = {}
 
         for status in ("READY", "FREE"):
@@ -1523,14 +1547,17 @@ class ControlTowerBot:
                     phone = str(s.get("phone") or "").strip()
                     if not phone:
                         continue
+                    loc_id   = s.get("locationId")
+                    loc_name = self._karri_locations.get(int(loc_id), "-") if loc_id else "-"
                     # READY tiene prioridad sobre FREE si el mismo teléfono aparece en ambos
                     if phone not in index or status == "READY":
                         index[phone] = {
-                            "karri_id":   s.get("id"),
-                            "status":     status,
-                            "locationId": s.get("locationId"),
-                            "firstName":  s.get("firstName", ""),
-                            "lastName":   s.get("lastName", ""),
+                            "karri_id":      s.get("id"),
+                            "status":        status,
+                            "locationId":    loc_id,
+                            "locationName":  loc_name,
+                            "firstName":     s.get("firstName", ""),
+                            "lastName":      s.get("lastName", ""),
                         }
             except Exception:
                 pass
@@ -1797,6 +1824,7 @@ def _shoppers_table(shoppers: List[Dict]) -> Table:
     t.add_column("Nombre",         style="bold white", min_width=30)
     t.add_column("Teléfono",       style="magenta",    min_width=14)
     t.add_column("Karri",          style="bold",       min_width=8,  justify="center")
+    t.add_column("Tienda Karri",   style="yellow",     min_width=20)
     t.add_column("Distancia",      style="cyan",       min_width=10, justify="right")
     t.add_column("Disponibilidad", style="bold",       min_width=14)
     t.add_column("Pedidos",        style="yellow",     min_width=10, justify="center")
@@ -1822,6 +1850,7 @@ def _shoppers_table(shoppers: List[Dict]) -> Table:
             else s.get("name", f"Shopper {i}"),
             s.get("phone", "-"),
             karri_str,
+            s.get("karri_location", "-"),
             s.get("distance", "-"),
             avail_str,
             s.get("assigned_orders", "-"),
@@ -2144,13 +2173,14 @@ async def run() -> None:
                     avail_icon = "🟢" if "Activo" in s.get("availability", "") else "🔴"
                     ks = s.get("karri_status", "-")
                     karri_tag = "[READY]" if ks == "READY" else "[FREE]" if ks == "FREE" else ""
+                    karri_loc = s.get("karri_location", "-")
                     label = (
                         f"{avail_icon}  {s.get('name', 'Shopper')}  ·  "
                         f"{s.get('phone', '-')}  ·  "
                         f"{s.get('distance', '-')}  ·  "
                         f"{s.get('vehicle', '-')}  ·  "
                         f"{s.get('assigned_orders', '?')} pedidos"
-                        + (f"  {karri_tag}" if karri_tag else "")
+                        + (f"  {karri_tag} {karri_loc}" if karri_tag else "")
                     )
                     shopper_choices.append(
                         questionary.Choice(label, value=s.get("btn_index", 0))
