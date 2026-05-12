@@ -79,6 +79,22 @@ Bot de terminal para gestión y asignación automática de pedidos en Instaleap 
                                           │  3. Click DOM + extraer del URL    │
                                           └────────────────────────────────────┘
 
+┌─ REFRESCO AUTOMÁTICO EN BACKGROUND (asyncio.Task) ───────────────────────────────┐
+│                                                                                  │
+│   Se inicia automáticamente al arrancar el bot (después del login).              │
+│                                                                                  │
+│   ┌─ cada 60 segundos ──────────────────────────────────────────────────────┐   │
+│   │  1. Fetch pedidos CREATED  hora actual + 2 slots siguientes             │   │
+│   │  2. Renueva índice Karri (si token expiró, re-login automático)         │   │
+│   │  3. Almacena en bot._cached_orders  y  bot._orders_updated_at           │   │
+│   └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                  │
+│   El menú muestra:  "N pedidos · Karri: X READY · última actualización HH:MM"   │
+│                                                                                  │
+│   start_bg_refresh() / stop_bg_refresh()  (stop automático al salir)            │
+│                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────┘
+
 ┌─ AUTO-ASIGNACIÓN (background asyncio.Task) ──────────────────────────────────────┐
 │                                                                                  │
 │   ┌─ cada 30 segundos ──────────────────────────────────────────────────────┐   │
@@ -91,19 +107,15 @@ Bot de terminal para gestión y asignación automática de pedidos en Instaleap 
 │   │                                                                         │   │
 │   │     ┌─ Nebula API → shoppers del pedido ──────────────────────────┐    │   │
 │   │     │                                                              │    │   │
-│   │     │  Filtro 1: nombre contiene "karri"                          │    │   │
+│   │     │  Filtro 1: nombre contiene "karri"  +  estado READY         │    │   │
 │   │     │  Filtro 2: wants_to_receive_tasks = true  (activo)          │    │   │
 │   │     │  Filtro 3: distancia ≤ 4,000 m                              │    │   │
-│   │     │  Filtro 4: phone en índice Karri  (si Karri activo)         │    │   │
 │   │     │                                                              │    │   │
 │   │     │  Vehículo según items:                                       │    │   │
 │   │     │   ≤ 15 items → pool Motos  (fallback: Autos)                │    │   │
 │   │     │   > 15 items → pool Autos únicamente                        │    │   │
 │   │     │                                                              │    │   │
-│   │     │  Score = 0.6×(dist/4000) + 0.3×(pedidos/10) + karri_bonus  │    │   │
-│   │     │          READY → bonus 0.0  (prioridad máxima)              │    │   │
-│   │     │          FREE  → bonus 0.1                                  │    │   │
-│   │     │                                                              │    │   │
+│   │     │  Score = 0.7×(dist/4000) + 0.3×(pedidos/10)                │    │   │
 │   │     │  Asigna: POST manualAssignation al de menor score           │    │   │
 │   │     └──────────────────────────────────────────────────────────────┘    │   │
 │   │                                                                         │   │

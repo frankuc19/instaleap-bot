@@ -110,6 +110,10 @@ class ControlTowerBot:
         self._last_shoppers: List[Dict]        = []   # caché de shoppers para asignación
         self._auto_assign_task: Optional[asyncio.Task]  = None
         self._auto_assign_stop: Optional[asyncio.Event] = None
+        self._bg_refresh_task: Optional[asyncio.Task]   = None
+        self._bg_refresh_stop: Optional[asyncio.Event]  = None
+        self._cached_orders: List[Dict]                 = []
+        self._orders_updated_at: str                    = ""
         self._karri_token: Optional[str]        = None
         self._karri_phone_index: Dict[str, Dict] = {}   # phone → {status, locationId, …}
         self._karri_locations: Dict[int, str]    = {}   # locationId → nombre de tienda
@@ -1569,6 +1573,58 @@ class ControlTowerBot:
             f"{sum(1 for v in index.values() if v['status']=='FREE')} FREE[/dim]"
         )
 
+    # ── Refresco automático en background ──────────────────────────────────────
+
+    async def _bg_refresh_loop(self, stop_event: asyncio.Event) -> None:
+        """Cada 60 s actualiza pedidos del turno y el índice Karri en background."""
+        CYCLE_SECS = 60
+        while not stop_event.is_set():
+            try:
+                await self._ensure_token()
+                await self._ensure_karri_token()
+
+                now      = datetime.now()
+                date_str = now.strftime("%Y-%m-%d")
+                orders: List[Dict] = []
+                for i in range(3):
+                    h    = (now + timedelta(hours=i)).hour
+                    data = await self._api_get_jobs(date_str, h)
+                    orders.extend(self._parse_jobs_response(data, f"{h:02d}:00-{h:02d}:59"))
+
+                await self._api_refresh_karri_index()
+
+                self._cached_orders     = orders
+                self._orders_updated_at = now.strftime("%H:%M:%S")
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                # No interrumpir el loop por errores transitorios
+                console.print(f"  [dim red]  BG refresh error: {exc}[/dim red]")
+
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=CYCLE_SECS)
+            except asyncio.TimeoutError:
+                pass
+
+    async def start_bg_refresh(self) -> None:
+        if self._bg_refresh_task and not self._bg_refresh_task.done():
+            return
+        self._bg_refresh_stop = asyncio.Event()
+        self._bg_refresh_task = asyncio.create_task(
+            self._bg_refresh_loop(self._bg_refresh_stop)
+        )
+
+    async def stop_bg_refresh(self) -> None:
+        if self._bg_refresh_stop:
+            self._bg_refresh_stop.set()
+        if self._bg_refresh_task:
+            try:
+                await asyncio.wait_for(self._bg_refresh_task, timeout=10)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                self._bg_refresh_task.cancel()
+            self._bg_refresh_task = None
+            self._bg_refresh_stop = None
+
     # ── Auto-asignación (algoritmo tipo Uber) ──────────────────────────────────
 
     async def _auto_assign_loop(self, stop_event: asyncio.Event) -> None:
@@ -1660,20 +1716,16 @@ class ControlTowerBot:
                         if dist_m > RADIUS_M:
                             continue
 
-                        # ── Cruce con Karri: si el índice existe, excluir shoppers ausentes
+                        # ── Cruce con Karri: solo shoppers con estado READY
                         phone = str(r.get("phone_number") or r.get("phoneNumber") or r.get("phone") or "").strip()
-                        karri_status = "-"
                         if self._karri_phone_index:
                             entry = self._karri_phone_index.get(phone)
-                            if not entry:
-                                continue   # shopper no está en Karri → omitir
-                            karri_status = entry["status"]   # "READY" o "FREE"
+                            if not entry or entry["status"] != "READY":
+                                continue   # no está en Karri o no es READY → omitir
 
                         orders_count = int(r.get("number_of_orders") or r.get("numberOfOrders") or 0)
                         vehicle = str(r.get("vehicle_type") or r.get("vehicleType") or "").strip()
-                        # Puntaje: 0.6 dist + 0.3 carga + 0.1 karri (READY=0, FREE=0.1)
-                        karri_bonus = 0.0 if karri_status == "READY" else 0.1
-                        score = 0.6 * (dist_m / RADIUS_M) + 0.3 * (orders_count / 10.0) + karri_bonus
+                        score = 0.7 * (dist_m / RADIUS_M) + 0.3 * (orders_count / 10.0)
                         candidates.append((score, vehicle, r))
 
                     if not candidates:
@@ -1907,12 +1959,23 @@ async def run() -> None:
         else:
             console.print("  [yellow]  No se pudo conectar a Karri — continuando sin cruce.[/yellow]\n")
 
-        # ── Estado ─────────────────────────────────────────────────────────────
-        cached_orders: List[Dict] = []
+        # ── Refresco automático en background ──────────────────────────────────
+        await bot.start_bg_refresh()
 
         # ── Menú principal ─────────────────────────────────────────────────────
         while True:
             console.print()
+            # Mostrar estado del refresh en background
+            if bot._orders_updated_at:
+                ready_count  = sum(
+                    1 for v in bot._karri_phone_index.values() if v["status"] == "READY"
+                )
+                console.print(
+                    f"  [dim]🔄 Auto-actualización activa  ·  "
+                    f"{len(bot._cached_orders)} pedido(s) en turno  ·  "
+                    f"Karri: {ready_count} READY  ·  "
+                    f"última actualización {bot._orders_updated_at}[/dim]"
+                )
             auto_running = (
                 bot._auto_assign_task is not None
                 and not bot._auto_assign_task.done()
@@ -1937,6 +2000,7 @@ async def run() -> None:
             # ── Salir ──────────────────────────────────────────────────────────
             if action == "exit":
                 await bot.stop_auto_assign()
+                await bot.stop_bg_refresh()
                 console.print("\n[dim]  Cerrando bot. ¡Hasta luego![/dim]\n")
                 break
 
@@ -2034,7 +2098,8 @@ async def run() -> None:
                     style=BOT_STYLE,
                 ).ask_async()
                 if usar:
-                    cached_orders = all_orders_date
+                    bot._cached_orders     = all_orders_date
+                    bot._orders_updated_at = datetime.now().strftime("%H:%M:%S")
                     console.print(
                         "  [dim]Pedidos cargados en caché. "
                         "Usa '🔍 Asignar shopper' para continuar.[/dim]"
@@ -2042,7 +2107,7 @@ async def run() -> None:
                 continue
 
             # ── Cargar / refrescar pedidos del turno ───────────────────────────
-            if action == "refresh" or (action == "assign" and not cached_orders):
+            if action == "refresh" or (action == "assign" and not bot._cached_orders):
                 slots = bot.current_slots()
 
                 console.print()
@@ -2068,7 +2133,8 @@ async def run() -> None:
                         all_orders.extend(orders)
                         prog.advance(task)
 
-                cached_orders = all_orders
+                bot._cached_orders     = all_orders
+                bot._orders_updated_at = datetime.now().strftime("%H:%M:%S")
 
                 if not all_orders:
                     console.print(
@@ -2095,19 +2161,19 @@ async def run() -> None:
 
             # ── Asignación ─────────────────────────────────────────────────────
             if action == "assign":
-                if not cached_orders:
+                if not bot._cached_orders:
                     console.print("[yellow]  Carga los pedidos primero.[/yellow]")
                     continue
 
                 ALL_STORES     = "─ Todas las tiendas ─"
-                stores         = _unique_stores(cached_orders)
+                stores         = _unique_stores(bot._cached_orders)
                 selected_store = await questionary.select(
                     "Filtrar tienda:",
                     choices=[ALL_STORES] + stores,
                     style=BOT_STYLE,
                 ).ask_async()
 
-                visible = _filter(cached_orders, selected_store)
+                visible = _filter(bot._cached_orders, selected_store)
                 if not visible:
                     console.print("[yellow]  Sin pedidos para esa tienda.[/yellow]")
                     continue
@@ -2152,15 +2218,16 @@ async def run() -> None:
                 with console.status("[bold blue]Cargando shoppers disponibles...[/bold blue]"):
                     shoppers = await bot.fetch_shoppers(selected_order)
 
-                # Solo shoppers KARRI
+                # Solo shoppers KARRI con estado READY
                 shoppers = [
                     s for s in shoppers
                     if "karri" in s.get("name", "").lower()
+                    and s.get("karri_status") == "READY"
                 ]
 
                 if not shoppers:
                     console.print(
-                        "[yellow]  No se encontraron shoppers KARRI en el panel de asignación.[/yellow]\n"
+                        "[yellow]  No se encontraron shoppers KARRI con estado READY.[/yellow]\n"
                         "[dim]  Verifica manualmente en Control Tower.[/dim]"
                     )
                     continue
@@ -2220,8 +2287,8 @@ async def run() -> None:
                         f"\n  [bold green]✓  Shopper asignado correctamente "
                         f"al pedido {o.get('reference', '')}[/bold green]\n"
                     )
-                    cached_orders = [
-                        c for c in cached_orders
+                    bot._cached_orders = [
+                        c for c in bot._cached_orders
                         if c.get("reference") != o.get("reference")
                     ]
                 else:
