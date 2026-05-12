@@ -1627,11 +1627,16 @@ class ControlTowerBot:
 
     # ── Auto-asignación (algoritmo tipo Uber) ──────────────────────────────────
 
-    async def _auto_assign_loop(self, stop_event: asyncio.Event) -> None:
+    async def _auto_assign_loop(
+        self,
+        stop_event: asyncio.Event,
+        allowed_stores: Optional[List[str]] = None,
+    ) -> None:
         """
         Ciclo de auto-asignación.  Cada CYCLE_SECS segundos:
           1. Obtiene pedidos CREADOS de la hora actual.
-          2. Para cada pedido sin shopper asignado:
+          2. Filtra por tienda si allowed_stores no es None.
+          3. Para cada pedido sin shopper asignado:
              a. Llama al endpoint nebula para obtener shoppers activos.
              b. Filtra: wants_to_receive_tasks=True  AND  distancia <= RADIUS_M.
              c. Puntúa cada shopper:  score = 0.7*(dist/RADIUS_M) + 0.3*(orders/10)
@@ -1642,9 +1647,13 @@ class ControlTowerBot:
         CYCLE_SECS = 30
         assigned_refs: set = set()
 
+        store_label = (
+            ", ".join(allowed_stores) if allowed_stores else "todas las tiendas"
+        )
         console.print(
             "\n  [bold green]▶  Auto-asignación iniciada "
-            f"(radio {RADIUS_M//1000} km, ciclo {CYCLE_SECS}s)[/bold green]\n"
+            f"(radio {RADIUS_M//1000} km, ciclo {CYCLE_SECS}s, "
+            f"tiendas: {store_label})[/bold green]\n"
         )
 
         while not stop_event.is_set():
@@ -1663,6 +1672,10 @@ class ControlTowerBot:
                 for order in orders:
                     ref = order.get("reference", "")
                     if ref in assigned_refs:
+                        continue
+
+                    # Filtro por tienda (si se especificaron tiendas al activar)
+                    if allowed_stores and order.get("store", "") not in allowed_stores:
                         continue
 
                     task_id  = self._get_assignment_task_id(order)
@@ -1783,14 +1796,19 @@ class ControlTowerBot:
 
         console.print("\n  [bold yellow]⏹  Auto-asignación detenida.[/bold yellow]\n")
 
-    async def start_auto_assign(self) -> None:
-        """Inicia el loop de auto-asignación en background."""
+    async def start_auto_assign(
+        self, stores: Optional[List[str]] = None
+    ) -> None:
+        """Inicia el loop de auto-asignación en background.
+
+        stores: lista de nombres de tienda a procesar, o None para todas.
+        """
         if self._auto_assign_task and not self._auto_assign_task.done():
             console.print("  [yellow]  La auto-asignación ya está activa.[/yellow]")
             return
         self._auto_assign_stop = asyncio.Event()
         self._auto_assign_task = asyncio.create_task(
-            self._auto_assign_loop(self._auto_assign_stop)
+            self._auto_assign_loop(self._auto_assign_stop, allowed_stores=stores or None)
         )
 
     async def stop_auto_assign(self) -> None:
@@ -1963,6 +1981,8 @@ async def run() -> None:
         await bot.start_bg_refresh()
 
         # ── Menú principal ─────────────────────────────────────────────────────
+        _auto_stores: Optional[List[str]] = None   # tiendas activas en el loop actual
+
         while True:
             console.print()
             # Mostrar estado del refresh en background
@@ -1980,11 +2000,17 @@ async def run() -> None:
                 bot._auto_assign_task is not None
                 and not bot._auto_assign_task.done()
             )
-            auto_choice = (
-                questionary.Choice("⏹  Detener asignación automática", value="auto_stop")
-                if auto_running else
-                questionary.Choice("▶  Activar asignación automática", value="auto_start")
-            )
+            if auto_running:
+                store_tag = (
+                    f"  [{', '.join(_auto_stores)}]" if _auto_stores else "  [todas las tiendas]"
+                )
+                auto_choice = questionary.Choice(
+                    f"⏹  Detener asignación automática{store_tag}", value="auto_stop"
+                )
+            else:
+                auto_choice = questionary.Choice(
+                    "▶  Activar asignación automática", value="auto_start"
+                )
             action = await questionary.select(
                 "Menú principal:",
                 choices=[
@@ -2006,12 +2032,35 @@ async def run() -> None:
 
             # ── Auto-asignación: iniciar ───────────────────────────────────────
             if action == "auto_start":
-                await bot.start_auto_assign()
+                ALL_TAG = "─ Todas las tiendas ─"
+                stores_in_cache = _unique_stores(bot._cached_orders)
+
+                if stores_in_cache:
+                    selected_stores = await questionary.checkbox(
+                        "¿En qué tiendas activar la auto-asignación? "
+                        "(Espacio = seleccionar, Enter = confirmar)",
+                        choices=[ALL_TAG] + stores_in_cache,
+                        style=BOT_STYLE,
+                    ).ask_async()
+
+                    if selected_stores is None:
+                        continue
+
+                    if not selected_stores or ALL_TAG in selected_stores:
+                        _auto_stores = None   # todas
+                    else:
+                        _auto_stores = selected_stores
+                else:
+                    # Sin pedidos en caché → activar para todas
+                    _auto_stores = None
+
+                await bot.start_auto_assign(stores=_auto_stores)
                 continue
 
             # ── Auto-asignación: detener ───────────────────────────────────────
             if action == "auto_stop":
                 await bot.stop_auto_assign()
+                _auto_stores = None
                 continue
 
             # ── Pedidos por fecha elegida ──────────────────────────────────────
