@@ -112,8 +112,8 @@ class ControlTowerBot:
         self._auto_assign_stop: Optional[asyncio.Event] = None
         self._karri_token: Optional[str]       = None
         self._karri_phone_index: Dict[str, Dict] = {}   # phone → {status, locationId, …}
-        self._karri_email: Optional[str]      = None
-        self._karri_password: Optional[str]   = None
+        self._karri_email: Optional[str]      = "francisco.martinez@karri.com.mx"
+        self._karri_password: Optional[str]   = "Karri.2027"
         self._karri_token_at: float           = 0.0     # timestamp del último login Karri
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -1861,40 +1861,19 @@ async def run() -> None:
         token_ok = "[green]✓ API conectada[/green]" if bot._auth_token else "[yellow]⚠ sin token API[/yellow]"
         console.print(f"  [bold green]✓[/bold green] Sesión iniciada · {token_ok}\n")
 
-        # ── Login Karri (opcional) ─────────────────────────────────────────────
+        # ── Login Karri automático ─────────────────────────────────────────────
         console.print(Rule("[bold yellow]Karri Dashboard[/bold yellow]"))
-        use_karri = await questionary.confirm(
-            "¿Conectar con Karri Dashboard para cruzar la fila de shoppers?",
-            default=True,
-            style=BOT_STYLE,
-        ).ask_async()
-        if use_karri:
-            karri_email = await questionary.text(
-                "Email de Karri:",
-                style=BOT_STYLE,
-            ).ask_async()
-            karri_pass = await questionary.password(
-                "Contraseña de Karri:",
-                style=BOT_STYLE,
-            ).ask_async()
-            if karri_email and karri_pass:
-                bot._karri_email    = karri_email.strip()
-                bot._karri_password = karri_pass
-                with console.status("[bold yellow]Iniciando sesión en Karri...[/bold yellow]"):
-                    ok = await bot._login_karri_and_capture_token()
-                if ok:
-                    with console.status("[bold yellow]Cargando fila de shoppers Karri...[/bold yellow]"):
-                        await bot._api_refresh_karri_index()
-                    console.print(
-                        f"  [bold green]✓[/bold green] Karri conectado  "
-                        f"({len(bot._karri_phone_index)} shoppers indexados)\n"
-                    )
-                else:
-                    console.print("  [yellow]  No se pudo conectar a Karri — continuando sin cruce.[/yellow]\n")
-            else:
-                console.print("  [dim]  Credenciales vacías — Karri desactivado.[/dim]\n")
+        with console.status("[bold yellow]Iniciando sesión en Karri...[/bold yellow]"):
+            ok = await bot._login_karri_and_capture_token()
+        if ok:
+            with console.status("[bold yellow]Cargando fila de shoppers Karri...[/bold yellow]"):
+                await bot._api_refresh_karri_index()
+            console.print(
+                f"  [bold green]✓[/bold green] Karri conectado  "
+                f"({len(bot._karri_phone_index)} shoppers indexados)\n"
+            )
         else:
-            console.print("  [dim]  Karri desactivado — sin cruce de fila.[/dim]\n")
+            console.print("  [yellow]  No se pudo conectar a Karri — continuando sin cruce.[/yellow]\n")
 
         # ── Estado ─────────────────────────────────────────────────────────────
         cached_orders: List[Dict] = []
