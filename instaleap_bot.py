@@ -1595,14 +1595,17 @@ class ControlTowerBot:
                     phone = str(s.get("phone") or "").strip()
                     if not phone:
                         continue
+
                     loc_id   = s.get("locationId")
                     loc_name = self._karri_locations.get(int(loc_id), "-") if loc_id else "-"
                     # READY tiene prioridad sobre FREE si el mismo teléfono aparece en ambos
                     if phone not in index or status == "READY":
+                        # locationAssignedAt = momento en que el shopper entró a la geocerca
                         queued_raw = (
-                            s.get("readyAt") or s.get("queuedAt")
-                            or s.get("createdAt") or s.get("updatedAt")
-                            or s.get("timestamp")
+                            s.get("locationAssignedAt")
+                            or s.get("readyAt")
+                            or s.get("queuedAt")
+                            or s.get("lastLocationAt")
                         )
                         index[phone] = {
                             "karri_id":      s.get("id"),
