@@ -1178,6 +1178,31 @@ class ControlTowerBot:
             "_resource":       r,
         }
 
+    @staticmethod
+    def _parse_queued_ts(raw: Any) -> float:
+        """Convierte un timestamp ISO/epoch de Karri a float unix. inf si no parseable."""
+        if not raw:
+            return float("inf")
+        try:
+            if isinstance(raw, (int, float)):
+                ts = float(raw)
+                return ts / 1000 if ts > 1e10 else ts   # epoch ms → s
+            s = str(raw).strip().replace("Z", "+00:00")
+            return datetime.fromisoformat(s).timestamp()
+        except Exception:
+            return float("inf")
+
+    @staticmethod
+    def _fmt_queued(raw: Any) -> str:
+        """Formatea hora de entrada a la cola como HH:MM. '-' si no disponible."""
+        ts = ControlTowerBot._parse_queued_ts(raw)
+        if ts == float("inf"):
+            return "-"
+        try:
+            return datetime.fromtimestamp(ts).strftime("%H:%M")
+        except Exception:
+            return "-"
+
     def _apply_karri_status(self, shoppers: List[Dict]) -> List[Dict]:
         """
         Cruza la lista de shoppers de Instaleap con _karri_phone_index por phone.
@@ -1190,8 +1215,10 @@ class ControlTowerBot:
         for s in shoppers:
             phone = s.get("phone", "").strip()
             entry = self._karri_phone_index.get(phone)
-            s["karri_status"]   = entry["status"]       if entry else "-"
-            s["karri_location"] = entry["locationName"] if entry else "-"
+            s["karri_status"]    = entry["status"]       if entry else "-"
+            s["karri_location"]  = entry["locationName"] if entry else "-"
+            s["karri_queued_at"] = self._fmt_queued(entry.get("queued_at")) if entry else "-"
+            s["karri_queued_ts"] = self._parse_queued_ts(entry.get("queued_at")) if entry else float("inf")
         return shoppers
 
     async def fetch_shoppers(self, order: Dict) -> List[Dict]:
@@ -1555,6 +1582,11 @@ class ControlTowerBot:
                     loc_name = self._karri_locations.get(int(loc_id), "-") if loc_id else "-"
                     # READY tiene prioridad sobre FREE si el mismo teléfono aparece en ambos
                     if phone not in index or status == "READY":
+                        queued_raw = (
+                            s.get("readyAt") or s.get("queuedAt")
+                            or s.get("createdAt") or s.get("updatedAt")
+                            or s.get("timestamp")
+                        )
                         index[phone] = {
                             "karri_id":      s.get("id"),
                             "status":        status,
@@ -1562,6 +1594,7 @@ class ControlTowerBot:
                             "locationName":  loc_name,
                             "firstName":     s.get("firstName", ""),
                             "lastName":      s.get("lastName", ""),
+                            "queued_at":     queued_raw,
                         }
             except Exception:
                 pass
@@ -1643,7 +1676,6 @@ class ControlTowerBot:
                 (menor puntaje = mejor candidato).
              d. Asigna el shopper con menor puntaje si odin_job_id disponible.
         """
-        RADIUS_M    = 4_000   # 4 km en metros
         CYCLE_SECS  = 30
         MAX_PER_SLOT = 2      # máximo de pedidos por shopper en el mismo slot
 
@@ -1659,8 +1691,8 @@ class ControlTowerBot:
         )
         console.print(
             "\n  [bold green]▶  Auto-asignación iniciada "
-            f"(radio {RADIUS_M//1000} km, ciclo {CYCLE_SECS}s, "
-            f"máx {MAX_PER_SLOT} pedidos/shopper/slot, "
+            f"(ciclo {CYCLE_SECS}s, máx {MAX_PER_SLOT} pedidos/shopper/slot, "
+            f"prioridad: hora de entrada a cola, "
             f"tiendas: {store_label})[/bold green]\n"
         )
 
@@ -1740,32 +1772,22 @@ class ControlTowerBot:
                         if not active:
                             continue
 
-                        dist_raw = r.get("distance") or 0
-                        try:
-                            dist_m = float(dist_raw)
-                            if dist_m <= 20:
-                                dist_m *= 1000
-                        except (TypeError, ValueError):
-                            dist_m = float("inf")
-
-                        if dist_m > RADIUS_M:
-                            continue
-
                         phone = str(r.get("phone_number") or r.get("phoneNumber") or r.get("phone") or "").strip()
+                        queued_ts = float("inf")
                         if self._karri_phone_index:
                             entry = self._karri_phone_index.get(phone)
                             if not entry or entry["status"] != "READY":
                                 continue
+                            queued_ts = self._parse_queued_ts(entry.get("queued_at"))
 
                         # ── Límite: máx MAX_PER_SLOT pedidos por shopper en este slot
                         shopper_id = str(r.get("id") or r.get("resourceId") or phone)
                         if assigned_per_shopper.get(shopper_id, {}).get(slot_str, 0) >= MAX_PER_SLOT:
                             continue
 
-                        orders_count = int(r.get("number_of_orders") or r.get("numberOfOrders") or 0)
                         vehicle = str(r.get("vehicle_type") or r.get("vehicleType") or "").strip()
-                        score = 0.7 * (dist_m / RADIUS_M) + 0.3 * (orders_count / 10.0)
-                        candidates.append((score, vehicle, shopper_id, r))
+                        # Score = hora de entrada a la cola (menor timestamp = entró antes = prioridad máxima)
+                        candidates.append((queued_ts, vehicle, shopper_id, r))
 
                     if not candidates:
                         continue
@@ -1786,7 +1808,7 @@ class ControlTowerBot:
                         vehicle_note = "auto (>15 items)" if items_n > 15 else "auto (sin dato de items)"
 
                     pool.sort(key=lambda x: x[0])
-                    best_score, _, best_sid, best_resource = pool[0]
+                    best_ts, _, best_sid, best_resource = pool[0]
 
                     ok = await self._api_assign_shopper(odin_job_id, task_id, best_resource)
                     shopper_name = (
@@ -1799,10 +1821,11 @@ class ControlTowerBot:
                         order_shopper_map[ref] = (best_sid, slot_str)
                         slots = assigned_per_shopper.setdefault(best_sid, {})
                         slots[slot_str] = slots.get(slot_str, 0) + 1
+                        cola_str = datetime.fromtimestamp(best_ts).strftime("%H:%M") if best_ts != float("inf") else "-"
                         console.print(
                             f"  [bold green]✓ Auto-asignado:[/bold green] {ref} → "
                             f"{shopper_name}  [{vehicle_note}]  "
-                            f"(score={best_score:.3f}, slot {slot_str}: "
+                            f"(cola desde {cola_str}, slot {slot_str}: "
                             f"{slots[slot_str]}/{MAX_PER_SLOT})"
                         )
                     else:
@@ -1921,7 +1944,7 @@ def _shoppers_table(shoppers: List[Dict]) -> Table:
     t.add_column("Teléfono",       style="magenta",    min_width=14)
     t.add_column("Karri",          style="bold",       min_width=8,  justify="center")
     t.add_column("Tienda Karri",   style="yellow",     min_width=20)
-    t.add_column("Distancia",      style="cyan",       min_width=10, justify="right")
+    t.add_column("En cola desde",  style="cyan",       min_width=12, justify="center")
     t.add_column("Disponibilidad", style="bold",       min_width=14)
     t.add_column("Pedidos",        style="yellow",     min_width=10, justify="center")
     t.add_column("Vehículo",       style="magenta",    min_width=12, justify="center")
@@ -1947,7 +1970,7 @@ def _shoppers_table(shoppers: List[Dict]) -> Table:
             s.get("phone", "-"),
             karri_str,
             s.get("karri_location", "-"),
-            s.get("distance", "-"),
+            s.get("karri_queued_at", "-"),
             avail_str,
             s.get("assigned_orders", "-"),
             s.get("vehicle", "-"),
@@ -2319,7 +2342,7 @@ async def run() -> None:
                     label = (
                         f"{avail_icon}  {s.get('name', 'Shopper')}  ·  "
                         f"{s.get('phone', '-')}  ·  "
-                        f"{s.get('distance', '-')}  ·  "
+                        f"cola: {s.get('karri_queued_at', '-')}  ·  "
                         f"{s.get('vehicle', '-')}  ·  "
                         f"{s.get('assigned_orders', '?')} pedidos"
                         + (f"  {karri_tag} {karri_loc}" if karri_tag else "")
