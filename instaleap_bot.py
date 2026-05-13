@@ -1730,8 +1730,10 @@ class ControlTowerBot:
             f"tiendas: {store_label})[/bold green]\n"
         )
 
+        cycle_n = 0
         while not stop_event.is_set():
             try:
+                cycle_n += 1
                 await self._ensure_token()
                 await self._api_refresh_karri_index()
                 now      = datetime.now()
@@ -1742,10 +1744,21 @@ class ControlTowerBot:
                     data = await self._api_get_jobs(date_str, h)
                     orders.extend(self._parse_jobs_response(data, f"{h:02d}:00-{h:02d}:59"))
 
+                # Filtrar solo las tiendas activas para el conteo del log
+                orders_scope = [
+                    o for o in orders
+                    if not allowed_stores or o.get("store", "") in allowed_stores
+                ]
+                pendientes = [o for o in orders_scope if o.get("reference", "") not in assigned_refs]
+                ready_n    = sum(1 for v in self._karri_phone_index.values() if v["status"] == "READY")
+                self._log(
+                    f"  [dim]── Ciclo {cycle_n} · {now.strftime('%H:%M:%S')} · "
+                    f"{len(orders_scope)} pedido(s) en tienda(s) · "
+                    f"{len(pendientes)} sin asignar · "
+                    f"{ready_n} shoppers READY[/dim]"
+                )
+
                 # ── Detectar rechazos con período de gracia ───────────────────
-                # Un pedido asignado debe aparecer como CREATED REJECTION_GRACE
-                # ciclos consecutivos antes de considerarse rechazado.
-                # Esto evita doble-asignación cuando el backend tarda en actualizar.
                 current_refs = {o.get("reference", "") for o in orders}
                 for ref in list(assigned_refs):
                     if ref in current_refs:
@@ -1763,7 +1776,6 @@ class ControlTowerBot:
                                 f"→ disponible para reasignación[/yellow]"
                             )
                     else:
-                        # Ya no aparece como CREATED → backend actualizó, resetear contador
                         rejection_seen.pop(ref, None)
 
                 for order in orders:
@@ -1777,6 +1789,7 @@ class ControlTowerBot:
                     task_id  = self._get_assignment_task_id(order)
                     store_id = order.get("store_id", "")
                     if not task_id or not store_id:
+                        self._log(f"  [dim]  {ref}: sin task_id/store_id → omitido[/dim]")
                         continue
 
                     if not order.get("odin_job_id"):
@@ -1786,13 +1799,19 @@ class ControlTowerBot:
 
                     odin_job_id = order.get("odin_job_id", "")
                     if not odin_job_id:
+                        self._log(f"  [dim]  {ref}: sin odin_job_id → omitido[/dim]")
                         continue
 
                     resources = await self._api_get_shoppers_nebula(task_id, store_id)
                     if not resources:
+                        self._log(f"  [dim]  {ref}: sin shoppers en nebula[/dim]")
                         continue
 
                     slot_str = order.get("slot", "")
+
+                    # Contadores de filtros para el log
+                    cnt_total = len(resources)
+                    cnt_no_karri = cnt_no_active = cnt_no_ready = cnt_at_limit = 0
 
                     candidates = []
                     for r in resources:
@@ -1800,6 +1819,7 @@ class ControlTowerBot:
                             r.get("name") or r.get("fullName") or r.get("displayName") or ""
                         )
                         if "karri" not in shopper_name.lower():
+                            cnt_no_karri += 1
                             continue
 
                         active = bool(
@@ -1812,6 +1832,7 @@ class ControlTowerBot:
                             or str(r.get("status") or "").upper() in ("ACTIVE", "ACTIVO", "AVAILABLE", "ENABLED")
                         )
                         if not active:
+                            cnt_no_active += 1
                             continue
 
                         phone = str(r.get("phone_number") or r.get("phoneNumber") or r.get("phone") or "").strip()
@@ -1819,17 +1840,27 @@ class ControlTowerBot:
                         if self._karri_phone_index:
                             entry = self._karri_phone_index.get(phone)
                             if not entry or entry["status"] != "READY":
+                                cnt_no_ready += 1
                                 continue
                             queued_ts = self._parse_queued_ts(entry.get("queued_at"))
 
-                        # ── Límite: máx MAX_PER_SLOT pedidos por shopper en este slot
                         shopper_id = str(r.get("id") or r.get("resourceId") or phone)
                         if assigned_per_shopper.get(shopper_id, {}).get(slot_str, 0) >= MAX_PER_SLOT:
+                            cnt_at_limit += 1
                             continue
 
                         vehicle = str(r.get("vehicle_type") or r.get("vehicleType") or "").strip()
-                        # Score = hora de entrada a la cola (menor timestamp = entró antes = prioridad máxima)
                         candidates.append((queued_ts, vehicle, shopper_id, r))
+
+                    self._log(
+                        f"  [dim]  {ref} [{order.get('store','')}] "
+                        f"· {cnt_total} shoppers nebula "
+                        f"· -{cnt_no_karri} no-KARRI "
+                        f"· -{cnt_no_active} inactivos "
+                        f"· -{cnt_no_ready} sin READY "
+                        f"· -{cnt_at_limit} al límite "
+                        f"· {len(candidates)} candidatos[/dim]"
+                    )
 
                     if not candidates:
                         continue
