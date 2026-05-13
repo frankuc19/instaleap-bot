@@ -223,28 +223,35 @@ class ControlTowerBot:
             return None
 
     async def _ensure_token(self) -> bool:
-        """Garantiza que tenemos un JWT válido (no 'null' ni basura) antes de la API."""
-        # Descartar token inválido que pudo haber sido capturado antes de que Auth0 iniciara
+        """Garantiza que tenemos un JWT válido. Si la sesión expiró, re-hace login."""
         if self._auth_token and not self._is_valid_jwt(self._auth_token):
             self._auth_token = None
 
         if self._auth_token:
             return True
 
-        # Recargar métricas para disparar requests autenticados
+        # Intento 1: recargar métricas para disparar requests autenticados
         await self._goto(METRICS_URL)
-        for _ in range(40):          # hasta 12 s
+        for _ in range(40):
             if self._auth_token and self._is_valid_jwt(self._auth_token):
                 return True
             await asyncio.sleep(0.3)
 
-        # Fallback: localStorage / sessionStorage
+        # Intento 2: localStorage / sessionStorage
         token = await self._extract_token_from_page()
         if token and self._is_valid_jwt(token):
             self._auth_token = token
+            return True
+
+        # Intento 3: sesión expirada → re-login completo automático
+        self._log("  [yellow]  Sesión Instaleap expirada — re-login automático...[/yellow]")
+        try:
+            await self.login()
+        except Exception as exc:
+            self._log(f"  [red]  Re-login falló: {exc}[/red]")
 
         if not self._auth_token:
-            console.print("  [red]  No se pudo obtener el JWT. ¿Sesión expirada?[/red]")
+            self._log("  [red]  No se pudo renovar la sesión de Instaleap.[/red]")
         return bool(self._auth_token)
 
     # ── Login ──────────────────────────────────────────────────────────────────
@@ -901,8 +908,6 @@ class ControlTowerBot:
                 # Buscar cualquier ID numérico de 8-12 dígitos en la respuesta
                 ids = re.findall(r'["\s:]([0-9]{8,12})[",\s\}]', text)
                 if ids:
-                    console.print(f"  [dim]  Odin API encontró IDs en {url.split(ODIN_BASE)[1]}: {ids[:3]}[/dim]")
-                    # Preferir ID de 9 dígitos que empiece con 17x (patrón odin_job_id)
                     preferred = [i for i in ids if len(i) == 9 and i.startswith("17")]
                     return preferred[0] if preferred else ids[0]
             except Exception:
@@ -1536,7 +1541,7 @@ class ControlTowerBot:
             return
         elapsed = asyncio.get_event_loop().time() - self._karri_token_at
         if elapsed > 55 * 60:   # 55 minutos
-            console.print("  [dim]  Renovando token Karri...[/dim]")
+            self._log("  [dim]  Renovando token Karri...[/dim]")
             await self._login_karri_and_capture_token()
 
     async def _api_refresh_karri_index(self) -> None:
@@ -1682,8 +1687,11 @@ class ControlTowerBot:
                 (menor puntaje = mejor candidato).
              d. Asigna el shopper con menor puntaje si odin_job_id disponible.
         """
-        CYCLE_SECS  = 30
+        CYCLE_SECS   = 30
         MAX_PER_SLOT = 2      # máximo de pedidos por shopper en el mismo slot
+        # Ciclos consecutivos como CREATED que se exigen antes de asumir rechazo.
+        # Evita falsos positivos cuando el backend demora en actualizar el estado.
+        REJECTION_GRACE = 2
 
         # ref → (shopper_id, slot)  para detectar rechazos
         order_shopper_map: Dict[str, tuple] = {}
@@ -1691,11 +1699,13 @@ class ControlTowerBot:
         assigned_per_shopper: Dict[str, Dict[str, int]] = {}
         # pedidos ya asignados esta sesión (se elimina si el shopper rechaza)
         assigned_refs: set = set()
+        # ref → contador de ciclos seguidos en que apareció como CREATED post-asignación
+        rejection_seen: Dict[str, int] = {}
 
         store_label = (
             ", ".join(allowed_stores) if allowed_stores else "todas las tiendas"
         )
-        console.print(
+        self._log(
             "\n  [bold green]▶  Auto-asignación iniciada "
             f"(ciclo {CYCLE_SECS}s, máx {MAX_PER_SLOT} pedidos/shopper/slot, "
             f"prioridad: hora de entrada a cola, "
@@ -1714,21 +1724,29 @@ class ControlTowerBot:
                     data = await self._api_get_jobs(date_str, h)
                     orders.extend(self._parse_jobs_response(data, f"{h:02d}:00-{h:02d}:59"))
 
-                # ── Detectar rechazos: un pedido asignado que reaparece como
-                #    CREATED significa que el shopper lo rechazó → liberar
+                # ── Detectar rechazos con período de gracia ───────────────────
+                # Un pedido asignado debe aparecer como CREATED REJECTION_GRACE
+                # ciclos consecutivos antes de considerarse rechazado.
+                # Esto evita doble-asignación cuando el backend tarda en actualizar.
                 current_refs = {o.get("reference", "") for o in orders}
                 for ref in list(assigned_refs):
                     if ref in current_refs:
-                        assigned_refs.discard(ref)
-                        if ref in order_shopper_map:
-                            prev_sid, prev_slot = order_shopper_map.pop(ref)
-                            slots = assigned_per_shopper.get(prev_sid, {})
-                            if slots.get(prev_slot, 0) > 0:
-                                slots[prev_slot] -= 1
-                        self._log(
-                            f"  [yellow]↩ Pedido {ref} rechazado por el shopper "
-                            f"→ disponible para reasignación[/yellow]"
-                        )
+                        rejection_seen[ref] = rejection_seen.get(ref, 0) + 1
+                        if rejection_seen[ref] >= REJECTION_GRACE:
+                            assigned_refs.discard(ref)
+                            rejection_seen.pop(ref, None)
+                            if ref in order_shopper_map:
+                                prev_sid, prev_slot = order_shopper_map.pop(ref)
+                                slots = assigned_per_shopper.get(prev_sid, {})
+                                if slots.get(prev_slot, 0) > 0:
+                                    slots[prev_slot] -= 1
+                            self._log(
+                                f"  [yellow]↩ Pedido {ref} rechazado por el shopper "
+                                f"→ disponible para reasignación[/yellow]"
+                            )
+                    else:
+                        # Ya no aparece como CREATED → backend actualizó, resetear contador
+                        rejection_seen.pop(ref, None)
 
                 for order in orders:
                     ref = order.get("reference", "")
@@ -1859,7 +1877,7 @@ class ControlTowerBot:
         stores: lista de nombres de tienda a procesar, o None para todas.
         """
         if self._auto_assign_task and not self._auto_assign_task.done():
-            console.print("  [yellow]  La auto-asignación ya está activa.[/yellow]")
+            self._log("  [yellow]  La auto-asignación ya está activa.[/yellow]")
             return
         self._auto_assign_stop = asyncio.Event()
         self._auto_assign_task = asyncio.create_task(
