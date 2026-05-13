@@ -19,6 +19,7 @@ import sys
 import re
 import json
 import urllib.parse
+import os
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
@@ -93,6 +94,19 @@ BOT_STYLE = QStyle([
 
 console = Console()
 
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "instaleap_bot.log")
+
+
+def _write_log(msg: str) -> None:
+    """Escribe una línea al archivo de log (sin markup Rich)."""
+    try:
+        plain = re.sub(r"\[/?[a-zA-Z0-9 _#]*\]", "", msg).strip()
+        if plain:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.now().strftime('%H:%M:%S')}] {plain}\n")
+    except Exception:
+        pass
+
 
 # ─── Bot ───────────────────────────────────────────────────────────────────────
 
@@ -123,8 +137,9 @@ class ControlTowerBot:
         self._pending_log: List[str]          = []      # mensajes de background, se muestran entre iteraciones del menú
 
     def _log(self, msg: str) -> None:
-        """Acumula un mensaje de background para mostrarlo en la próxima iteración del menú."""
+        """Acumula un mensaje de background y lo escribe al archivo de log."""
         self._pending_log.append(msg)
+        _write_log(msg)
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -2054,6 +2069,7 @@ async def run() -> None:
             console.print("  [yellow]  No se pudo conectar a Karri — continuando sin cruce.[/yellow]\n")
 
         # ── Refresco automático en background ──────────────────────────────────
+        _write_log(f"Bot iniciado — log en {LOG_FILE}")
         await bot.start_bg_refresh()
 
         # ── Menú principal ─────────────────────────────────────────────────────
@@ -2100,10 +2116,31 @@ async def run() -> None:
                     questionary.Choice("📅  Ver pedidos por fecha",               value="bydate"),
                     questionary.Choice("🔍  Asignar shopper a un pedido",         value="assign"),
                     auto_choice,
+                    questionary.Choice("📄  Ver actividad reciente",              value="activity"),
                     questionary.Choice("❌  Salir",                               value="exit"),
                 ],
                 style=BOT_STYLE,
             ).ask_async()
+
+            # ── Ver actividad reciente ──────────────────────────────────────────
+            if action == "activity":
+                console.print()
+                console.print(Rule("[bold]Actividad reciente[/bold]"))
+                try:
+                    with open(LOG_FILE, encoding="utf-8") as f:
+                        lines = f.readlines()
+                    last = lines[-50:] if len(lines) > 50 else lines
+                    if last:
+                        for line in last:
+                            console.print(f"  [dim]{line.rstrip()}[/dim]")
+                    else:
+                        console.print("  [dim]Sin actividad registrada aún.[/dim]")
+                except FileNotFoundError:
+                    console.print("  [dim]Sin actividad registrada aún.[/dim]")
+                console.print(Rule())
+                console.print(f"  [dim]Log completo: {LOG_FILE}[/dim]")
+                console.print(f"  [dim]Para monitoreo en tiempo real: tail -f {LOG_FILE}[/dim]\n")
+                continue
 
             # ── Salir ──────────────────────────────────────────────────────────
             if action == "exit":
