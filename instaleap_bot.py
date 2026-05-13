@@ -1883,12 +1883,18 @@ class ControlTowerBot:
                     pool.sort(key=lambda x: x[0])
                     best_ts, _, best_sid, best_resource = pool[0]
 
+                    # Posición en cola: lugar del shopper dentro de todos los candidatos KARRI READY
+                    all_sorted    = sorted(candidates, key=lambda x: x[0])
+                    queue_pos     = next((i + 1 for i, c in enumerate(all_sorted) if c[2] == best_sid), "?")
+                    total_in_pool = len(candidates)
+
                     ok = await self._api_assign_shopper(odin_job_id, task_id, best_resource)
                     shopper_name = (
                         best_resource.get("name")
                         or best_resource.get("fullName")
                         or best_resource.get("id", "?")
                     )
+                    store_name = order.get("store", "-")
                     if ok:
                         assigned_refs.add(ref)
                         order_shopper_map[ref] = (best_sid, slot_str)
@@ -1896,14 +1902,20 @@ class ControlTowerBot:
                         slots[slot_str] = slots.get(slot_str, 0) + 1
                         cola_str = datetime.fromtimestamp(best_ts).strftime("%H:%M") if best_ts != float("inf") else "-"
                         self._log(
-                            f"  [bold green]✓ Auto-asignado:[/bold green] {ref} → "
-                            f"{shopper_name}  [{vehicle_note}]  "
-                            f"(cola desde {cola_str}, slot {slot_str}: "
-                            f"{slots[slot_str]}/{MAX_PER_SLOT})"
+                            f"  [bold green]✓ ASIGNADO[/bold green]  "
+                            f"Pedido: [cyan]{ref}[/cyan]  "
+                            f"Tienda: [yellow]{store_name}[/yellow]  "
+                            f"Slot: [blue]{slot_str}[/blue]\n"
+                            f"     Shopper: [bold]{shopper_name}[/bold]  "
+                            f"Vehículo: {vehicle_note}  "
+                            f"Cola: pos {queue_pos}/{total_in_pool} (entró {cola_str})  "
+                            f"Pedidos en slot: {slots[slot_str]}/{MAX_PER_SLOT}"
                         )
                     else:
                         self._log(
-                            f"  [yellow]✗ Fallo auto-asignación:[/yellow] {ref} → {shopper_name}"
+                            f"  [yellow]✗ Fallo:[/yellow]  "
+                            f"Pedido: {ref}  Tienda: {store_name}  "
+                            f"Shopper intentado: {shopper_name}"
                         )
 
             except asyncio.CancelledError:
