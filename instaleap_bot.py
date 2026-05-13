@@ -120,6 +120,11 @@ class ControlTowerBot:
         self._karri_email: Optional[str]      = "francisco.martinez@karri.com.mx"
         self._karri_password: Optional[str]   = "Karri.2027"
         self._karri_token_at: float           = 0.0     # timestamp del último login Karri
+        self._pending_log: List[str]          = []      # mensajes de background, se muestran entre iteraciones del menú
+
+    def _log(self, msg: str) -> None:
+        """Acumula un mensaje de background para mostrarlo en la próxima iteración del menú."""
+        self._pending_log.append(msg)
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -397,8 +402,6 @@ class ControlTowerBot:
                     break
 
         if not items:
-            if isinstance(data, dict) and data:
-                console.print(f"  [dim]  API resp keys ({slot_str}): {list(data.keys())}[/dim]")
             return []
 
         orders: List[Dict] = []
@@ -1600,11 +1603,6 @@ class ControlTowerBot:
                 pass
 
         self._karri_phone_index = index
-        console.print(
-            f"  [dim]  Karri index actualizado: "
-            f"{sum(1 for v in index.values() if v['status']=='READY')} READY  "
-            f"{sum(1 for v in index.values() if v['status']=='FREE')} FREE[/dim]"
-        )
 
     # ── Refresco automático en background ──────────────────────────────────────
 
@@ -1631,8 +1629,7 @@ class ControlTowerBot:
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                # No interrumpir el loop por errores transitorios
-                console.print(f"  [dim red]  BG refresh error: {exc}[/dim red]")
+                self._log(f"  [dim red]  BG refresh error: {exc}[/dim red]")
 
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=CYCLE_SECS)
@@ -1719,7 +1716,7 @@ class ControlTowerBot:
                             slots = assigned_per_shopper.get(prev_sid, {})
                             if slots.get(prev_slot, 0) > 0:
                                 slots[prev_slot] -= 1
-                        console.print(
+                        self._log(
                             f"  [yellow]↩ Pedido {ref} rechazado por el shopper "
                             f"→ disponible para reasignación[/yellow]"
                         )
@@ -1822,28 +1819,28 @@ class ControlTowerBot:
                         slots = assigned_per_shopper.setdefault(best_sid, {})
                         slots[slot_str] = slots.get(slot_str, 0) + 1
                         cola_str = datetime.fromtimestamp(best_ts).strftime("%H:%M") if best_ts != float("inf") else "-"
-                        console.print(
+                        self._log(
                             f"  [bold green]✓ Auto-asignado:[/bold green] {ref} → "
                             f"{shopper_name}  [{vehicle_note}]  "
                             f"(cola desde {cola_str}, slot {slot_str}: "
                             f"{slots[slot_str]}/{MAX_PER_SLOT})"
                         )
                     else:
-                        console.print(
+                        self._log(
                             f"  [yellow]✗ Fallo auto-asignación:[/yellow] {ref} → {shopper_name}"
                         )
 
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                console.print(f"  [red]  Error en ciclo auto-asignación: {exc}[/red]")
+                self._log(f"  [red]  Error en ciclo auto-asignación: {exc}[/red]")
 
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=CYCLE_SECS)
             except asyncio.TimeoutError:
                 pass
 
-        console.print("\n  [bold yellow]⏹  Auto-asignación detenida.[/bold yellow]\n")
+        self._log("\n  [bold yellow]⏹  Auto-asignación detenida.[/bold yellow]\n")
 
     async def start_auto_assign(
         self, stores: Optional[List[str]] = None
@@ -2034,6 +2031,12 @@ async def run() -> None:
 
         while True:
             console.print()
+            # Vaciar mensajes pendientes de loops en background
+            if bot._pending_log:
+                for msg in bot._pending_log:
+                    console.print(msg)
+                bot._pending_log.clear()
+                console.print()
             # Mostrar estado del refresh en background
             if bot._orders_updated_at:
                 ready_count  = sum(
