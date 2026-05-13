@@ -251,12 +251,21 @@ class ControlTowerBot:
 
     async def login(self) -> None:
         """Inicia sesión en Control Tower via Auth0."""
+        # Limpiar cookies y storage para evitar redirecciones de sesiones anteriores
+        await self.ctx.clear_cookies()
+        await self.page.goto("about:blank")
+        try:
+            await self.page.evaluate("() => { localStorage.clear(); sessionStorage.clear(); }")
+        except Exception:
+            pass
+
         await self.page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30_000)
         await self.page.wait_for_load_state("networkidle", timeout=30_000)
 
         # Paso 1: email
         email_sel = 'input[type="email"], input[name="email"], input[type="text"]'
         await self.page.wait_for_selector(email_sel, timeout=15_000)
+        await self.page.fill(email_sel, "")          # limpiar campo antes de escribir
         await self.page.fill(email_sel, CREDS["email"])
         await self.page.click(
             'button[type="submit"], button:has-text("Continuar"), button:has-text("Continue")'
@@ -265,7 +274,7 @@ class ControlTowerBot:
 
         # Paso 2: password (Auth0)
         pwd_sel = 'input[type="password"], input[name="password"]'
-        await self.page.wait_for_selector(pwd_sel, timeout=15_000)
+        await self.page.wait_for_selector(pwd_sel, timeout=20_000)
         await self.page.fill(pwd_sel, CREDS["password"])
         await self.page.click(
             'button[type="submit"], button:has-text("Continuar"), button:has-text("Continue")'
